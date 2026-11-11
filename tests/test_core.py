@@ -179,6 +179,20 @@ class DocumentTests(unittest.TestCase):
         self.assertFalse(points[1].smooth)
         self.assertAlmostEqual(loaded.layers[0].opacity, 0.5)
 
+    def test_ensure_suffix_keeps_real_extension(self) -> None:
+        self.assertEqual(io.ensure_suffix("/tmp/drawing.json", ".json"), Path("/tmp/drawing.json"))
+        self.assertEqual(io.ensure_suffix("/tmp/drawing.PNG", ".png"), Path("/tmp/drawing.PNG"))
+
+    def test_ensure_suffix_appends_when_missing(self) -> None:
+        self.assertEqual(io.ensure_suffix("/tmp/drawing", ".png"), Path("/tmp/drawing.png"))
+
+    def test_ensure_suffix_replaces_portal_placeholder(self) -> None:
+        # xdg-desktop-portal-termfilechooser suggests "termfilechooser.tmp"
+        self.assertEqual(
+            io.ensure_suffix("/home/alex/termfilechooser.tmp", ".json"),
+            Path("/home/alex/termfilechooser.json"),
+        )
+
     def test_svg_export(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "drawing.svg"
@@ -563,6 +577,35 @@ class CanvasTests(unittest.TestCase):
         self.assertEqual(len(canvas.doc.layer().strokes), 0)
         canvas.redo()
         self.assertEqual(len(canvas.doc.layer().strokes), 1)
+
+    def test_wheel_width_change_is_undoable(self) -> None:
+        canvas = Canvas(Document())
+        stroke = Stroke([Point(0, 0, 4), Point(50, 0, 4)])
+        canvas.doc.layer().strokes.append(stroke)
+        canvas.tool = Canvas.TOOL_EDIT
+        canvas._hover = (stroke, 0)
+        canvas._adjust_point_width(2.0)
+        canvas._adjust_point_width(2.0)
+        self.assertAlmostEqual(stroke.points[0].width, 8.0)
+        self.assertEqual(len(canvas._undo_stack), 1)
+        canvas.undo()
+        self.assertAlmostEqual(canvas.doc.layer().strokes[0].points[0].width, 4.0)
+        canvas.redo()
+        self.assertAlmostEqual(canvas.doc.layer().strokes[0].points[0].width, 8.0)
+
+    def test_wheel_width_on_another_point_is_a_new_undo(self) -> None:
+        canvas = Canvas(Document())
+        stroke = Stroke([Point(0, 0, 4), Point(50, 0, 4)])
+        canvas.doc.layer().strokes.append(stroke)
+        canvas.tool = Canvas.TOOL_EDIT
+        canvas._hover = (stroke, 0)
+        canvas._adjust_point_width(1.0)
+        canvas._hover = (stroke, 1)
+        canvas._adjust_point_width(1.0)
+        self.assertEqual(len(canvas._undo_stack), 2)
+        canvas.undo()
+        widths = [point.width for point in canvas.doc.layer().strokes[0].points]
+        self.assertEqual(widths, [5.0, 4.0])
 
     def test_erase_splits_stroke(self) -> None:
         canvas = Canvas(Document())

@@ -49,6 +49,8 @@ class Canvas(QWidget):
         self._drag_point: Point | None = None
         self._cursor: QPointF | None = None
         self._width_last: QPointF | None = None
+        # One undo entry per wheel burst on a single point; (id(stroke), index).
+        self._width_edit_key: tuple[int, int] | None = None
         self._preview_sharp = False
         self._hover: tuple[Stroke, int] | None = None
         self._hovered_stroke: Stroke | None = None
@@ -82,6 +84,7 @@ class Canvas(QWidget):
         self._active_stroke = None
         self._hover = None
         self._hovered_stroke = None
+        self._width_edit_key = None
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.documentChanged.emit()
@@ -103,6 +106,7 @@ class Canvas(QWidget):
         self._active_stroke = None
         self._hover = None
         self._hovered_stroke = None
+        self._width_edit_key = None
         self.documentChanged.emit()
         self.update()
 
@@ -116,6 +120,7 @@ class Canvas(QWidget):
         self._active_stroke = None
         self._hover = None
         self._hovered_stroke = None
+        self._width_edit_key = None
         self.documentChanged.emit()
         self.update()
 
@@ -539,9 +544,11 @@ class Canvas(QWidget):
         self._hover = None
         self._hovered_stroke = None
         self._cursor = None
+        self._width_edit_key = None
         self.update()
 
     def mousePressEvent(self, event) -> None:
+        self._width_edit_key = None
         pos = event.position()
         if event.button() == Qt.MouseButton.MiddleButton or (
             event.button() == Qt.MouseButton.LeftButton and self._space_down
@@ -665,6 +672,7 @@ class Canvas(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event) -> None:
+        self._width_edit_key = None
         pos = event.position()
         scene = self.to_scene(pos)
         self._cursor = scene
@@ -788,16 +796,27 @@ class Canvas(QWidget):
     def _adjust_point_width(self, step: float) -> bool:
         target = self._hover
         if target is None:
+            self._width_edit_key = None
             return False
         stroke, index = target
         layer = self.active_vector_layer()
         if layer is None or stroke not in layer.strokes:
             self._hover = None
+            self._width_edit_key = None
             return False
         if not 0 <= index < len(stroke.points):
+            self._width_edit_key = None
             return False
         point = stroke.points[index]
-        point.width = min(200.0, max(0.0, point.width + step))
+        width = min(200.0, max(0.0, point.width + step))
+        if width == point.width:
+            return True
+        key = (id(stroke), index)
+        if key != self._width_edit_key:
+            # One undo entry for a whole wheel burst on the same point.
+            self.push_undo()
+            self._width_edit_key = key
+        point.width = width
         self.statusMessage.emit(f"width {point.width:.1f}")
         self.documentChanged.emit()
         self.update()

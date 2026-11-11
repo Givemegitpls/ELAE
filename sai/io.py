@@ -18,6 +18,20 @@ FORMAT = "sai-lineart"
 VERSION = 2
 
 
+def ensure_suffix(path: str | Path, suffix: str) -> Path:
+    """Return ``path`` with ``suffix`` unless it already ends with a real extension.
+
+    Terminal file choosers built on xdg-desktop-portal hand back the portal's
+    placeholder name (``termfilechooser.tmp``) when the application suggests no
+    file name, so ``.tmp`` counts as "no extension" here.
+    """
+    result = Path(path)
+    current = result.suffix.lower()
+    if current and current != ".tmp":
+        return result
+    return result.with_suffix(suffix)
+
+
 def save_document(document: Document, path: str | Path) -> None:
     payload = {"format": FORMAT, "version": VERSION, **document.to_dict()}
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -141,6 +155,7 @@ __all__ = [
     "FORMAT",
     "VERSION",
     "encode_image",
+    "ensure_suffix",
     "export_png",
     "export_svg",
     "load_document",

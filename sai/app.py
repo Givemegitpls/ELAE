@@ -632,6 +632,16 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("view rotation reset")
 
     # --- files ----------------------------------------------------------
+    def _suggested_save_path(self, suffix: str) -> str:
+        """Default file name for save/export dialogs.
+
+        Qt forwards it to the portal as ``current_name``; without it the
+        portal suggests ``termfilechooser.tmp`` and that is what lands on disk.
+        """
+        if self._path is not None:
+            return str(self._path.with_suffix(suffix))
+        return str(Path.home() / f"drawing{suffix}")
+
     def _new_document(self) -> None:
         self.canvas.set_document(Document())
         self._path = None
@@ -661,10 +671,12 @@ class MainWindow(QMainWindow):
         self._write_document(self._path)
 
     def _save_document_as(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Save", "", "sai-lineart (*.json)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save", self._suggested_save_path(".json"), "sai-lineart (*.json)"
+        )
         if not path:
             return
-        self._path = Path(path)
+        self._path = io.ensure_suffix(path, ".json")
         self._write_document(self._path)
 
     def _write_document(self, path: Path) -> None:
@@ -680,15 +692,18 @@ class MainWindow(QMainWindow):
         if not dialog.exec():
             return
         scale, background = dialog.options()
-        path, _ = QFileDialog.getSaveFileName(self, "Export PNG", "", "PNG (*.png)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export PNG", self._suggested_save_path(".png"), "PNG (*.png)"
+        )
         if not path:
             return
+        target = io.ensure_suffix(path, ".png")
         try:
-            io.export_png(self.canvas.doc, path, scale=scale, background=background)
+            io.export_png(self.canvas.doc, target, scale=scale, background=background)
         except OSError as error:
             QMessageBox.critical(self, "Export failed", str(error))
             return
-        self.statusBar().showMessage(f"exported {path}")
+        self.statusBar().showMessage(f"exported {target}")
 
     def _import_raster(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -735,12 +750,15 @@ class MainWindow(QMainWindow):
             self.canvas.set_transform_values(*dialog.values())
 
     def _export_svg(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Export SVG", "", "SVG (*.svg)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export SVG", self._suggested_save_path(".svg"), "SVG (*.svg)"
+        )
         if not path:
             return
+        target = io.ensure_suffix(path, ".svg")
         try:
-            io.export_svg(self.canvas.doc, path)
+            io.export_svg(self.canvas.doc, target)
         except OSError as error:
             QMessageBox.critical(self, "Export failed", str(error))
             return
-        self.statusBar().showMessage(f"exported {path}")
+        self.statusBar().showMessage(f"exported {target}")

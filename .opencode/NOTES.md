@@ -34,6 +34,14 @@
   `QPainter.RenderHint.Antialiasing`). Unscoped aliases fail type checking.
 - `sai/canvas.py` keeps `self.doc`; undo/redo replace the object, so always read
   `canvas.doc` instead of caching a reference.
+- Wheel width in Edit (`_adjust_point_width`) pushes one undo per wheel burst on one point
+  (`_width_edit_key = (id(stroke), index)`); any mouse move/press or undo/redo/`set_document`
+  clears the key so the next burst starts a new entry.
+- File dialogs go through `xdg-desktop-portal-termfilechooser` + yazi here
+  (`QT_QPA_PLATFORMTHEME=xdgdesktopportal`). When the app passes no suggested file name the
+  portal creates `$HOME/termfilechooser.tmp` and yazi's Enter returns that path, so saves land
+  as `*.tmp`. Hence `io.ensure_suffix()` plus a suggested name in every `getSaveFileName` call —
+  keep passing `_suggested_save_path()` when adding new dialogs.
 
 ## Raster layers / PNG import
 - Raster layers keep a base64 PNG in `Layer.image_base64`; `render.layer_image()` decodes and caches it.

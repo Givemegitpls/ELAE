@@ -68,7 +68,7 @@ class PngExportDialog(QDialog):
         self._scale = QDoubleSpinBox(self)
         self._scale.setRange(0.5, 8.0)
         self._scale.setSingleStep(0.5)
-        self._scale.setValue(2.0)
+        self._scale.setValue(1.0)
         self._background = QComboBox(self)
         self._background.addItems(["transparent", "white"])
 

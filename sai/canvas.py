@@ -42,7 +42,7 @@ class Canvas(QWidget):
         self.doc = document or Document()
         self.tool = self.TOOL_DRAW
         self.brush_width = 6.0
-        self.color: tuple[int, int, int] = (20, 20, 20)
+        self.color: tuple[int, int, int] = (0, 0, 0)
         self.alpha = 255
         self.zoom = 1.0
         self.pan = QPointF(40.0, 40.0)

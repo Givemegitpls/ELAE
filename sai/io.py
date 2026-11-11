@@ -55,7 +55,7 @@ def load_document(path: str | Path) -> Document:
 def export_png(
     document: Document,
     path: str | Path,
-    scale: float = 2.0,
+    scale: float = 1.0,
     background: QColor | None = None,
 ) -> None:
     width = max(1, round(document.width * scale))

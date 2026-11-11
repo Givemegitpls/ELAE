@@ -192,6 +192,44 @@ class GeometryTests(unittest.TestCase):
             cosine = (before[0] * after[0] + before[1] * after[1]) / (length_before * length_after)
             self.assertGreater(cosine, 0.999, f"kink at smooth point {index}")
 
+    def test_closed_stroke_follows_its_circle(self) -> None:
+        stroke = Stroke(
+            [Point(0, 0, 3, True), Point(10, 0, 3, True), Point(10, 10, 3, True)],
+            closed=True,
+        )
+        center = (5.0, 5.0)
+        radius = math.hypot(5.0, 5.0)
+        for x, y, _ in sample_stroke(stroke):
+            self.assertAlmostEqual(math.hypot(x - center[0], y - center[1]), radius, delta=0.05)
+
+    def test_open_stroke_does_not_draw_the_closing_segment(self) -> None:
+        points = [Point(0, 0, 3, True), Point(10, 0, 3, True), Point(10, 10, 3, True)]
+        open_samples = sample_stroke(Stroke(points))
+        closed_samples = sample_stroke(Stroke(points, closed=True))
+        self.assertGreater(len(closed_samples), len(open_samples))
+        self.assertAlmostEqual(closed_samples[-1][0], 0.0, delta=0.05)
+        self.assertAlmostEqual(closed_samples[-1][1], 0.0, delta=0.05)
+
+    def test_arc_ends_exactly_on_its_point(self) -> None:
+        # Nearly collinear smooth points: the sampled arc must finish exactly on
+        # the point, otherwise a thick stroke shows a notch at the join.
+        stroke = Stroke(
+            [
+                Point(0, 0, 6),
+                Point(0, 30, 6, True),
+                Point(0.6, 60, 6, True),
+                Point(0, 90, 6),
+            ]
+        )
+        samples = sample_stroke(stroke)
+        for point in stroke.points:
+            self.assertTrue(
+                any(
+                    abs(x - point.x) < 1e-6 and abs(y - point.y) < 1e-6 for x, y, _width in samples
+                ),
+                f"point {point.x},{point.y} missing from samples",
+            )
+
     def test_nearest_point(self) -> None:
         stroke = Stroke([Point(0, 0, 1), Point(10, 0, 1)])
         index, distance = nearest_point(stroke, 9, 0)
@@ -241,6 +279,19 @@ class DocumentTests(unittest.TestCase):
             io.ensure_suffix("/home/alex/termfilechooser.tmp", ".json"),
             Path("/home/alex/termfilechooser.json"),
         )
+
+    def test_closed_stroke_roundtrip(self) -> None:
+        document = Document(100, 100)
+        document.layers[0].strokes.append(
+            Stroke([Point(0, 0, 2), Point(50, 0, 4, True), Point(50, 50, 2)], closed=True)
+        )
+        document.layers[0].strokes.append(Stroke([Point(0, 50, 2), Point(50, 50, 2)]))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "loop.json"
+            io.save_document(document, path)
+            loaded = io.load_document(path)
+        self.assertTrue(loaded.layers[0].strokes[0].closed)
+        self.assertFalse(loaded.layers[0].strokes[1].closed)
 
     def test_svg_export(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -937,6 +988,124 @@ class CanvasTests(unittest.TestCase):
         self.assertTrue(canvas._delete_point_at(QPointF(10, 0)))
         self.assertEqual([p.x for p in stroke.points], [0.0, 20.0])
         self.assertFalse(canvas._delete_point_at(QPointF(300, 300)))
+
+
+class SelectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _canvas(self, stroke: Stroke) -> Canvas:
+        canvas = Canvas(Document(200, 200))
+        canvas.doc.layer().strokes.append(stroke)
+        canvas.tool = Canvas.TOOL_EDIT
+        return canvas
+
+    def test_box_selection_picks_points_inside(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(50, 0, 2), Point(100, 0, 2)])
+        canvas = self._canvas(stroke)
+        count = canvas._select_in_rect(QRectF(-5, -5, 60, 10), add=False)
+        self.assertEqual(count, 2)
+        self.assertEqual(len(canvas.selected_points()), 2)
+
+    def test_shift_click_toggles_selection(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(50, 0, 2)])
+        canvas = self._canvas(stroke)
+        canvas._edit_press(QPointF(0, 0), True)
+        self.assertEqual(len(canvas.selected_points()), 1)
+        canvas._edit_press(QPointF(50, 0), True)
+        self.assertEqual(len(canvas.selected_points()), 2)
+        canvas._edit_press(QPointF(50, 0), True)
+        self.assertEqual(len(canvas.selected_points()), 1)
+
+    def test_plain_click_drags_without_selecting(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(50, 0, 2)])
+        canvas = self._canvas(stroke)
+        canvas._edit_press(QPointF(0, 0), False)
+        self.assertEqual(canvas.selected_points(), [])
+        self.assertEqual(len(canvas._drag_starts), 1)
+        self.assertIs(canvas._drag_starts[0][0], stroke.points[0])
+
+    def test_group_drag_moves_all_selected_points(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(50, 50, 2)])
+        canvas = self._canvas(stroke)
+        canvas._selected = [(stroke, 0), (stroke, 1)]
+        canvas._drag_origin = QPointF(0, 0)
+        canvas._drag_starts = [(point, point.x, point.y) for point in canvas.selected_points()]
+        # Scene coordinates are pan + position; move by (25, 15) in scene space.
+        position = canvas.pan + QPointF(25, 15)
+        event = QMouseEvent(
+            QEvent.Type.MouseMove,
+            position,
+            position,
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        canvas.mouseMoveEvent(event)
+        self.assertAlmostEqual(stroke.points[0].x, 25.0)
+        self.assertAlmostEqual(stroke.points[0].y, 15.0)
+        self.assertAlmostEqual(stroke.points[1].x, 75.0)
+        self.assertAlmostEqual(stroke.points[1].y, 65.0)
+
+    def test_group_width_is_a_single_undo(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(50, 0, 2), Point(100, 0, 2)])
+        canvas = self._canvas(stroke)
+        canvas._selected = [(stroke, 0), (stroke, 2)]
+        canvas._hover = (stroke, 0)
+        canvas._adjust_point_width(2.0)
+        canvas._adjust_point_width(2.0)
+        self.assertEqual([point.width for point in stroke.points], [6.0, 2.0, 6.0])
+        self.assertEqual(len(canvas._undo_stack), 1)
+        canvas.undo()
+        self.assertEqual(
+            [point.width for point in canvas.doc.layer().strokes[0].points], [2.0, 2.0, 2.0]
+        )
+
+    def test_delete_selected_splits_stroke(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(10, 0, 2), Point(20, 0, 2), Point(30, 0, 2)])
+        canvas = self._canvas(stroke)
+        canvas._selected = [(stroke, 1), (stroke, 2)]
+        self.assertTrue(canvas.delete_selected())
+        parts = canvas.doc.layer().strokes
+        self.assertEqual(len(parts), 2)
+        self.assertEqual([len(part.points) for part in parts], [1, 1])
+
+    def test_merge_endpoints_closes_stroke(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(50, 0, 2, True), Point(50, 50, 2)])
+        canvas = self._canvas(stroke)
+        canvas._selected = [(stroke, 0), (stroke, 2)]
+        self.assertTrue(canvas.merge_selected())
+        self.assertTrue(stroke.closed)
+        self.assertEqual(len(stroke.points), 3)
+
+    def test_merge_interior_points_uses_centre(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(40, 0, 4), Point(60, 0, 4), Point(100, 0, 2)])
+        canvas = self._canvas(stroke)
+        canvas._selected = [(stroke, 1), (stroke, 2)]
+        self.assertTrue(canvas.merge_selected())
+        self.assertEqual(len(stroke.points), 3)
+        self.assertAlmostEqual(stroke.points[1].x, 50.0)
+        self.assertAlmostEqual(stroke.points[1].width, 4.0)
+
+    def test_merge_joins_two_strokes(self) -> None:
+        first = Stroke([Point(0, 0, 2), Point(10, 0, 2)])
+        second = Stroke([Point(40, 0, 2), Point(50, 0, 2)])
+        canvas = self._canvas(first)
+        canvas.doc.layer().strokes.append(second)
+        canvas._selected = [(first, 1), (second, 0)]
+        self.assertTrue(canvas.merge_selected())
+        strokes = canvas.doc.layer().strokes
+        self.assertEqual(len(strokes), 1)
+        self.assertEqual(len(strokes[0].points), 3)
+        self.assertAlmostEqual(strokes[0].points[1].x, 25.0)
+
+    def test_close_stroke_makes_it_loop(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(50, 0, 2), Point(50, 50, 2)])
+        canvas = self._canvas(stroke)
+        canvas._hovered_stroke = stroke
+        self.assertTrue(canvas.close_selected_strokes())
+        self.assertTrue(stroke.closed)
 
 
 class LayerPanelTests(unittest.TestCase):

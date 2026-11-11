@@ -319,6 +319,15 @@ class MainWindow(QMainWindow):
         edit_menu = self.menuBar().addMenu("&Edit")
         self._add_action(edit_menu, "Undo", self.canvas.undo, QKeySequence.StandardKey.Undo)
         self._add_action(edit_menu, "Redo", self.canvas.redo, QKeySequence.StandardKey.Redo)
+        edit_menu.addSeparator()
+        self._add_action(
+            edit_menu, "Merge Selected Points", self._merge_selected, QKeySequence("M")
+        )
+        self._add_action(edit_menu, "Close Stroke", self._close_stroke, QKeySequence("Shift+M"))
+        self._add_action(edit_menu, "Delete Selected Points", self._delete_selected)
+        self._add_action(
+            edit_menu, "Deselect All", self._deselect_all, QKeySequence("Ctrl+Shift+A")
+        )
 
         view_menu = self.menuBar().addMenu("&View")
         self._add_action(
@@ -486,6 +495,7 @@ class MainWindow(QMainWindow):
             self.canvas.commit_transform()
         self.canvas.doc.active_layer = row
         self.canvas.clear_hover()
+        self.canvas.clear_selection()
         self._refresh_layers()
 
     def _on_layer_item_changed(self, item: QListWidgetItem) -> None:
@@ -736,6 +746,23 @@ class MainWindow(QMainWindow):
         self.canvas.doc.width = width
         self.canvas.doc.height = height
         self.canvas.update()
+
+    # --- edit -----------------------------------------------------------
+    def _merge_selected(self) -> None:
+        self.canvas.setFocus()
+        self.canvas.merge_selected()
+
+    def _close_stroke(self) -> None:
+        self.canvas.setFocus()
+        self.canvas.close_selected_strokes()
+
+    def _delete_selected(self) -> None:
+        self.canvas.setFocus()
+        self.canvas.delete_selected()
+
+    def _deselect_all(self) -> None:
+        self.canvas.setFocus()
+        self.canvas.clear_selection()
 
     def _transform_layer(self) -> None:
         self.canvas.begin_transform()

@@ -11,6 +11,8 @@
 
 - `sai/model.py` — `Point(x, y, width, smooth)`, `Stroke`, `Layer`, `Mask`, `Document`. JSON is the
   master format: `{"format": "sai-lineart", "version": 2, ...}` (version 1 loads and migrates).
+  `Stroke.closed` means last→first is drawn too; the key is written only when true, so old
+  files stay untouched and open.
 - `sai/geometry.py` — `sample_stroke()` turns points into `(x, y, width)` samples.
   A segment that starts at a sharp point is a straight chord: the corner ends the straight
   run, rounding resumes only after the next point (rule "B", user choice 2026-11-11).
@@ -22,6 +24,14 @@
   the line passes through a smooth point and only then bends, never kinking there.
   Parallel end tangents keep the Hermite (`handle = chord/3`) instead of collapsing to the
   chord, otherwise the join would kink.
+  When both tangents belong to one circle (`_arc_samples`) the segment is sampled on the exact
+  circle (≤10° per step), so long arcs and semicircles stay round; the circle is rejected if
+  the end tangent disagrees, otherwise the join would kink. The radius is interpolated from
+  start to end inside the segment: with nearly collinear points the constructed radii differ,
+  and sampling at a constant radius leaves the end point off by a fraction of a pixel — that
+  shows up as a notch in thick strokes (user bug report, 2026-11-11).
+  A closed stroke wraps neighbours in `_circle_tangents`/`_segment_tangents` and
+  `_segment_range` adds the last→first segment.
   Three smooth points form a semicircle. No roundness parameter.
 - `sai/render.py` — QPainter: one round-capped line per sample pair, width averaged per pair.
   No polygon offsetting, so no self-intersection artifacts.
@@ -75,6 +85,25 @@
   layer changes or its visibility flips.
 - `_draw_point_handles()` is shared: point marks are drawn in Edit/Width/Erase and in Recolor
   (user request: same anchors everywhere), for `active_vector_layer()` only.
+
+## Point selection and joining (Edit tool)
+- `Canvas._selected: list[(Stroke, index)]` holds references, not ids. undo/redo/`set_document`
+  and layer switches clear it: those replace the document object, so stale refs would drag dead
+  points. `selected_points()` prunes invalid entries on every use.
+- `_edit_press(scene, shift)` is the single entry point for Edit clicks: a plain click never
+  changes the selection — it drags the clicked point, or the whole selection when that point is
+  part of it (user request, 2026-11-11: plain selection broke the flow). Shift-click toggles a
+  point, a click on the curve inserts a point (old behaviour), anything else starts a rubber
+  band (`_box_start`).
+- `merge_selected()` (M): inside one stroke, two endpoints close it (`closed = True`, no points
+  removed); other points merge into the centre of mass at the lowest index. Two strokes join only
+  at their ends and keep the colour of the stroke that sits lower in the layer.
+- `delete_selected()` splits strokes at the removed indices and always emits a single undo entry;
+  removing points from a closed stroke reopens it.
+- Group wheel width reuses `_width_edit_key` with the literal `"selection"` key, so a wheel burst
+  is one undo entry for the whole selection.
+- Right click in Edit opens the canvas context menu only when something is selected; otherwise it
+  keeps deleting the point under the cursor.
 - Single-point strokes ("dots") need their own hit test: `nearest_curve_point()` returns index -1
   for `len(points) < 2`, so `_stroke_at()` measures the distance to the point itself with limit
   `max(hit_radius, width/2)`. The same blind spot exists in any curve-based picker.

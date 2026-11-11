@@ -5,13 +5,24 @@ import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QMenu, QWidget
 
 from . import fill
 from .geometry import nearest_curve_point, nearest_point, sample_stroke
 from .model import Document, Layer, Point, Stroke
 from .render import draw_document, draw_stroke
 from .transform import apply_transform, content_bounds, map_point
+
+
+def _merged_point(points: list[Point]) -> Point:
+    """Centre-of-mass point used by M (merge): averaged position and width."""
+    count = len(points)
+    return Point(
+        sum(point.x for point in points) / count,
+        sum(point.y for point in points) / count,
+        sum(point.width for point in points) / count,
+        all(point.smooth for point in points),
+    )
 
 
 class Canvas(QWidget):
@@ -49,8 +60,13 @@ class Canvas(QWidget):
         self._drag_point: Point | None = None
         self._cursor: QPointF | None = None
         self._width_last: QPointF | None = None
-        # One undo entry per wheel burst on a single point; (id(stroke), index).
-        self._width_edit_key: tuple[int, int] | None = None
+        # One undo entry per wheel burst; a per-point key or "selection" for a group.
+        self._width_edit_key: object | None = None
+        self._selected: list[tuple[Stroke, int]] = []
+        self._box_start: QPointF | None = None
+        self._box_current: QPointF | None = None
+        self._drag_origin: QPointF | None = None
+        self._drag_starts: list[tuple[Point, float, float]] = []
         self._preview_sharp = False
         self._hover: tuple[Stroke, int] | None = None
         self._hovered_stroke: Stroke | None = None
@@ -85,6 +101,11 @@ class Canvas(QWidget):
         self._hover = None
         self._hovered_stroke = None
         self._width_edit_key = None
+        self._selected = []
+        self._box_start = None
+        self._box_current = None
+        self._drag_origin = None
+        self._drag_starts = []
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.documentChanged.emit()
@@ -107,6 +128,11 @@ class Canvas(QWidget):
         self._hover = None
         self._hovered_stroke = None
         self._width_edit_key = None
+        self._selected = []
+        self._box_start = None
+        self._box_current = None
+        self._drag_origin = None
+        self._drag_starts = []
         self.documentChanged.emit()
         self.update()
 
@@ -121,6 +147,11 @@ class Canvas(QWidget):
         self._hover = None
         self._hovered_stroke = None
         self._width_edit_key = None
+        self._selected = []
+        self._box_start = None
+        self._box_current = None
+        self._drag_origin = None
+        self._drag_starts = []
         self.documentChanged.emit()
         self.update()
 
@@ -175,6 +206,56 @@ class Canvas(QWidget):
         self._hover = None
         self._hovered_stroke = None
         self.update()
+
+    # --- point selection -------------------------------------------------
+    def selected_points(self) -> list[Point]:
+        """Points of the active layer that are selected; stale refs are dropped."""
+        layer = self.active_vector_layer()
+        valid: list[tuple[Stroke, int]] = []
+        if layer is not None:
+            for stroke, index in self._selected:
+                if any(item is stroke for item in layer.strokes) and 0 <= index < len(
+                    stroke.points
+                ):
+                    valid.append((stroke, index))
+        self._selected = valid
+        return [stroke.points[index] for stroke, index in valid]
+
+    def clear_selection(self) -> None:
+        if self._selected:
+            self._selected = []
+            self.update()
+
+    def _is_selected(self, stroke: Stroke, index: int) -> bool:
+        return any(item is stroke and at == index for item, at in self._selected)
+
+    def _toggle_selected(self, stroke: Stroke, index: int) -> None:
+        if self._is_selected(stroke, index):
+            self._selected = [
+                (item, at) for item, at in self._selected if not (item is stroke and at == index)
+            ]
+        else:
+            self._selected.append((stroke, index))
+        self.update()
+
+    def _valid_selected(self) -> list[tuple[Stroke, int]]:
+        self.selected_points()
+        return list(self._selected)
+
+    def _select_in_rect(self, rect: QRectF, add: bool) -> int:
+        layer = self.active_vector_layer()
+        if layer is None:
+            return 0
+        if not add:
+            self._selected = []
+        for stroke in layer.strokes:
+            for index, point in enumerate(stroke.points):
+                if rect.contains(QPointF(point.x, point.y)) and not self._is_selected(
+                    stroke, index
+                ):
+                    self._selected.append((stroke, index))
+        self.update()
+        return len(self._selected)
 
     def finish_stroke(self) -> None:
         if self._active_stroke is not None:
@@ -244,22 +325,40 @@ class Canvas(QWidget):
         elif self.tool == self.TOOL_RECOLOR:
             self._draw_recolor_overlay(painter)
 
+        if self._box_start is not None and self._box_current is not None:
+            rect = QRectF(self._box_start, self._box_current).normalized()
+            painter.setPen(QPen(QColor(0, 170, 255), 1.2 / self.zoom, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(0, 170, 255, 40))
+            painter.drawRect(rect)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+
     def _draw_point_handles(self, painter: QPainter, layer: Layer) -> None:
         radius = 4.0 / self.zoom
         outline = QPen(QColor(0, 110, 220), 1.0 / self.zoom)
+        selected_pen = QPen(QColor(255, 110, 20), 2.0 / self.zoom)
         for stroke in layer.strokes:
             for index, point in enumerate(stroke.points):
                 is_hovered = (
                     self._hover is not None and self._hover[0] is stroke and self._hover[1] == index
                 )
-                pen = QPen(QColor(0, 170, 255), 2.5 / self.zoom) if is_hovered else outline
+                is_selected = self._is_selected(stroke, index)
+                if is_selected:
+                    pen = selected_pen
+                    marker = radius * 1.3
+                else:
+                    pen = QPen(QColor(0, 170, 255), 2.5 / self.zoom) if is_hovered else outline
+                    marker = radius
+                if is_selected:
+                    brush = QColor(255, 140, 40)
+                else:
+                    brush = QColor(30, 30, 30) if point.smooth else QColor(255, 200, 60)
                 painter.setPen(pen)
-                painter.setBrush(QColor(30, 30, 30) if point.smooth else QColor(255, 200, 60))
+                painter.setBrush(brush)
                 if point.smooth:
-                    painter.drawEllipse(QPointF(point.x, point.y), radius, radius)
+                    painter.drawEllipse(QPointF(point.x, point.y), marker, marker)
                 else:
                     painter.drawRect(
-                        QRectF(point.x - radius, point.y - radius, radius * 2, radius * 2)
+                        QRectF(point.x - marker, point.y - marker, marker * 2, marker * 2)
                     )
                 painter.setBrush(Qt.BrushStyle.NoBrush)
 
@@ -563,7 +662,13 @@ class Canvas(QWidget):
             if self.transform_mode:
                 self.commit_transform()
                 return
-            if self.tool == self.TOOL_EDIT and self._delete_point_at(self.to_scene(pos)):
+            if self.tool == self.TOOL_EDIT:
+                if self._valid_selected():
+                    self._edit_context_menu(event)
+                    return
+                if self._delete_point_at(self.to_scene(pos)):
+                    return
+                self.finish_stroke()
                 return
             self.finish_stroke()
             return
@@ -595,7 +700,7 @@ class Canvas(QWidget):
             smooth = not bool(canvas_event & Qt.KeyboardModifier.ControlModifier)
             self._draw_click(scene, smooth)
         elif self.tool == self.TOOL_EDIT:
-            self._edit_click(scene)
+            self._edit_press(scene, bool(canvas_event & Qt.KeyboardModifier.ShiftModifier))
         elif self.tool == self.TOOL_ERASE:
             self.push_undo()
             self._erase_at(scene)
@@ -692,6 +797,20 @@ class Canvas(QWidget):
                 self._set_transform_cursor(self._transform_hit(scene))
             return
 
+        if self._box_start is not None:
+            self._box_current = QPointF(scene)
+            self.update()
+            return
+
+        if self._drag_origin is not None:
+            delta = scene - self._drag_origin
+            for point, start_x, start_y in self._drag_starts:
+                point.x = start_x + delta.x()
+                point.y = start_y + delta.y()
+            self.statusMessage.emit(f"moved {len(self._drag_starts)} point(s)")
+            self.update()
+            return
+
         if self._drag_point is not None:
             self._drag_point.x = scene.x()
             self._drag_point.y = scene.y()
@@ -740,6 +859,13 @@ class Canvas(QWidget):
             self._tr_action = None
             self._set_transform_cursor("rotate")
             return
+        if self._box_start is not None:
+            self._finish_box_selection(event.modifiers())
+            return
+        if self._drag_origin is not None:
+            self._drag_origin = None
+            self._drag_starts = []
+            self.documentChanged.emit()
         if self._drag_point is not None:
             self._drag_point = None
             self.documentChanged.emit()
@@ -800,24 +926,36 @@ class Canvas(QWidget):
             return False
         stroke, index = target
         layer = self.active_vector_layer()
-        if layer is None or stroke not in layer.strokes:
+        if layer is None or not any(item is stroke for item in layer.strokes):
             self._hover = None
             self._width_edit_key = None
             return False
         if not 0 <= index < len(stroke.points):
             self._width_edit_key = None
             return False
-        point = stroke.points[index]
-        width = min(200.0, max(0.0, point.width + step))
-        if width == point.width:
+        if self._is_selected(stroke, index):
+            points = self.selected_points()
+            key: object = "selection"
+        else:
+            points = [stroke.points[index]]
+            key = (id(stroke), index)
+        updates: list[tuple[Point, float]] = []
+        for point in points:
+            width = min(200.0, max(0.0, point.width + step))
+            if width != point.width:
+                updates.append((point, width))
+        if not updates:
             return True
-        key = (id(stroke), index)
         if key != self._width_edit_key:
-            # One undo entry for a whole wheel burst on the same point.
+            # One undo entry for a whole wheel burst on the same target.
             self.push_undo()
             self._width_edit_key = key
-        point.width = width
-        self.statusMessage.emit(f"width {point.width:.1f}")
+        for point, width in updates:
+            point.width = width
+        if len(points) == 1:
+            self.statusMessage.emit(f"width {points[0].width:.1f}")
+        else:
+            self.statusMessage.emit(f"width of {len(points)} points")
         self.documentChanged.emit()
         self.update()
         return True
@@ -831,7 +969,14 @@ class Canvas(QWidget):
             elif event.key() == Qt.Key.Key_T:
                 self.transformValuesRequested.emit()
             return
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.finish_stroke()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            if self._valid_selected():
+                self.clear_selection()
+                self.statusMessage.emit("selection cleared")
+                return
             self.finish_stroke()
             return
         if event.key() == Qt.Key.Key_Space:
@@ -842,8 +987,14 @@ class Canvas(QWidget):
             self.update()
             return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self._valid_selected():
+                self.delete_selected()
+                return
             if self._cursor is not None:
                 self._delete_point_at(self._cursor)
+            return
+        if event.key() == Qt.Key.Key_M:
+            self.merge_selected()
             return
         super().keyPressEvent(event)
 
@@ -868,15 +1019,224 @@ class Canvas(QWidget):
         self.update()
 
     def _edit_click(self, scene: QPointF) -> None:
+        self._edit_press(scene, False)
+
+    def _edit_press(self, scene: QPointF, shift: bool) -> None:
+        """Left click in Edit: drag a point, Shift-click to select, drag to box.
+
+        A plain click never selects: it drags the clicked point, or the whole
+        selection when the clicked point is part of it.
+        """
         stroke, index = self._find_point(scene)
         if stroke is not None:
-            self.push_undo()
+            if shift:
+                self._toggle_selected(stroke, index)
+                self._hover = (stroke, index)
+                self.update()
+                return
+            if self._is_selected(stroke, index):
+                dragged = self.selected_points()
+            else:
+                dragged = [stroke.points[index]]
             self._hover = (stroke, index)
-            self._drag_point = stroke.points[index]
+            self.push_undo()
+            self._drag_origin = QPointF(scene)
+            self._drag_starts = [(point, point.x, point.y) for point in dragged]
             self.update()
             return
-        if not self._insert_point(scene):
+        if shift:
+            self._box_start = QPointF(scene)
+            self._box_current = QPointF(scene)
             self.update()
+            return
+        if self._insert_point(scene):
+            return
+        self._selected = []
+        self._box_start = QPointF(scene)
+        self._box_current = QPointF(scene)
+        self.update()
+
+    def _finish_box_selection(self, modifiers) -> None:
+        start = self._box_start
+        current = self._box_current
+        self._box_start = None
+        self._box_current = None
+        add = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        if start is None or current is None:
+            self.update()
+            return
+        rect = QRectF(start, current).normalized()
+        if rect.width() < 1e-6 and rect.height() < 1e-6:
+            if not add:
+                self._selected = []
+            self.statusMessage.emit("selection cleared")
+            self.update()
+            return
+        count = self._select_in_rect(rect, add)
+        self.statusMessage.emit(f"selected {count} point(s)")
+        self.update()
+
+    def delete_selected(self) -> bool:
+        """Remove every selected point; strokes split at the gaps."""
+        targets = self._valid_selected()
+        layer = self.active_vector_layer()
+        if not targets or layer is None:
+            self.statusMessage.emit("delete: nothing selected")
+            return False
+        removed: dict[int, set[int]] = {}
+        for stroke, index in targets:
+            removed.setdefault(id(stroke), set()).add(index)
+        self.push_undo()
+        new_strokes: list[Stroke] = []
+        for stroke in layer.strokes:
+            indices = removed.get(id(stroke))
+            if not indices:
+                new_strokes.append(stroke)
+                continue
+            groups: list[list[Point]] = []
+            current: list[Point] = []
+            for index, point in enumerate(stroke.points):
+                if index in indices:
+                    if current:
+                        groups.append(current)
+                    current = []
+                else:
+                    current.append(point)
+            if current:
+                groups.append(current)
+            for group in groups:
+                new_strokes.append(Stroke(group, stroke.color, stroke.alpha))
+        layer.strokes = new_strokes
+        self._selected = []
+        self._hover = None
+        self.statusMessage.emit(f"deleted {len(targets)} point(s)")
+        self.documentChanged.emit()
+        self.update()
+        return True
+
+    def merge_selected(self) -> bool:
+        """Blender-style M: merge the selected points into one at their centre."""
+        targets = self._valid_selected()
+        if len(targets) < 2:
+            self.statusMessage.emit("merge: select at least two points")
+            return False
+        layer = self.active_vector_layer()
+        if layer is None:
+            return False
+        strokes: list[Stroke] = []
+        for stroke, _index in targets:
+            if not any(item is stroke for item in strokes):
+                strokes.append(stroke)
+        if len(strokes) == 1:
+            return self._merge_within_stroke(targets)
+        return self._merge_across_strokes(targets, layer, strokes)
+
+    def _merge_within_stroke(self, targets: list[tuple[Stroke, int]]) -> bool:
+        stroke = targets[0][0]
+        count = len(stroke.points)
+        indices = sorted({index for item, index in targets if item is stroke})
+        if len(indices) < 2:
+            self.statusMessage.emit("merge: need two points of one stroke")
+            return False
+        if count >= 3 and indices == [0, count - 1]:
+            self.push_undo()
+            stroke.closed = True
+            self._selected = []
+            self.statusMessage.emit("stroke closed")
+            self.documentChanged.emit()
+            self.update()
+            return True
+        merged = _merged_point([stroke.points[index] for index in indices])
+        self.push_undo()
+        for index in reversed(indices):
+            del stroke.points[index]
+        at = indices[0]
+        stroke.points.insert(at, merged)
+        self._selected = [(stroke, at)]
+        self.statusMessage.emit("points merged")
+        self.documentChanged.emit()
+        self.update()
+        return True
+
+    def _merge_across_strokes(
+        self, targets: list[tuple[Stroke, int]], layer: Layer, strokes: list[Stroke]
+    ) -> bool:
+        if len(strokes) != 2:
+            self.statusMessage.emit("merge: join two strokes at a time")
+            return False
+        order = {id(stroke): position for position, stroke in enumerate(layer.strokes)}
+        first, second = sorted(strokes, key=lambda stroke: order.get(id(stroke), 0))
+        picked: dict[int, int] = {}
+        for stroke, index in targets:
+            if id(stroke) in picked:
+                self.statusMessage.emit("merge: pick one point per stroke")
+                return False
+            picked[id(stroke)] = index
+        first_index = picked[id(first)]
+        second_index = picked[id(second)]
+        if first_index not in (0, len(first.points) - 1):
+            self.statusMessage.emit("merge: select a stroke end")
+            return False
+        if second_index not in (0, len(second.points) - 1):
+            self.statusMessage.emit("merge: select a stroke end")
+            return False
+        head = list(first.points)
+        if first_index != len(first.points) - 1:
+            head.reverse()
+        tail = list(second.points)
+        if second_index != 0:
+            tail.reverse()
+        merged = _merged_point([head[-1], tail[0]])
+        points = head[:-1] + [merged] + tail[1:]
+        self.push_undo()
+        joined = Stroke(points, first.color, first.alpha)
+        position = next(index for index, stroke in enumerate(layer.strokes) if stroke is first)
+        layer.strokes = [stroke for stroke in layer.strokes if stroke is not second]
+        position = min(position, len(layer.strokes) - 1)
+        layer.strokes[position] = joined
+        self._selected = [(joined, len(head) - 1)]
+        self.statusMessage.emit("strokes joined")
+        self.documentChanged.emit()
+        self.update()
+        return True
+
+    def close_selected_strokes(self) -> bool:
+        targets = self._valid_selected()
+        strokes: list[Stroke] = []
+        for stroke, _index in targets:
+            if not any(item is stroke for item in strokes):
+                strokes.append(stroke)
+        if not strokes and self._hovered_stroke is not None:
+            strokes = [self._hovered_stroke]
+        pending = [stroke for stroke in strokes if len(stroke.points) >= 3 and not stroke.closed]
+        if not pending:
+            self.statusMessage.emit("close: select a stroke with three points")
+            return False
+        self.push_undo()
+        for stroke in pending:
+            stroke.closed = True
+        self._selected = []
+        self.statusMessage.emit(f"closed {len(pending)} stroke(s)")
+        self.documentChanged.emit()
+        self.update()
+        return True
+
+    def _edit_context_menu(self, event) -> None:
+        menu = QMenu(self)
+        merge = menu.addAction("Merge Selected (M)")
+        close = menu.addAction("Close Stroke")
+        delete = menu.addAction("Delete Selected Points (Del)")
+        menu.addSeparator()
+        clear = menu.addAction("Deselect All (Esc)")
+        chosen = menu.exec(event.globalPosition().toPoint())
+        if chosen is merge:
+            self.merge_selected()
+        elif chosen is close:
+            self.close_selected_strokes()
+        elif chosen is delete:
+            self.delete_selected()
+        elif chosen is clear:
+            self.clear_selection()
 
     def _insert_point(self, scene: QPointF) -> bool:
         radius = self.hit_radius()
@@ -893,7 +1253,7 @@ class Canvas(QWidget):
 
         stroke, index, _, t, _x, _y = best
         start = stroke.points[index]
-        end = stroke.points[index + 1]
+        end = stroke.points[(index + 1) % len(stroke.points)]
         point = Point(
             scene.x(),
             scene.y(),

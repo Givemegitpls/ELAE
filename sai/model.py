@@ -20,16 +20,20 @@ class Stroke:
     points: list[Point] = field(default_factory=list)
     color: tuple[int, int, int] = (20, 20, 20)
     alpha: int = 255
+    closed: bool = False
 
     def copy(self) -> Stroke:
-        return Stroke([p.copy() for p in self.points], self.color, self.alpha)
+        return Stroke([p.copy() for p in self.points], self.color, self.alpha, self.closed)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "color": list(self.color),
             "alpha": self.alpha,
             "points": [[p.x, p.y, p.width, p.smooth] for p in self.points],
         }
+        if self.closed:
+            data["closed"] = True
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Stroke:
@@ -38,7 +42,7 @@ class Stroke:
         ]
         red, green, blue = (int(c) for c in data.get("color", (20, 20, 20)))
         color = (red, green, blue)
-        return cls(points, color, int(data.get("alpha", 255)))
+        return cls(points, color, int(data.get("alpha", 255)), bool(data.get("closed", False)))
 
 
 @dataclass

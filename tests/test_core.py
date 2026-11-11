@@ -109,7 +109,7 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(samples[1][:2], (50.0, 0.0))
 
     def test_three_points_form_a_semicircle(self) -> None:
-        stroke = Stroke([Point(0, 0, 3), Point(50, 0, 3, True), Point(50, 50, 3)])
+        stroke = Stroke([Point(0, 0, 3, True), Point(50, 0, 3, True), Point(50, 50, 3, True)])
         center = (25.0, 25.0)
         radius = math.hypot(25.0, 25.0)
         for x, y, _ in sample_stroke(stroke):
@@ -119,10 +119,10 @@ class GeometryTests(unittest.TestCase):
     def test_junction_between_segments_is_smooth(self) -> None:
         stroke = Stroke(
             [
-                Point(0, 0, 3),
+                Point(0, 0, 3, True),
                 Point(50, 0, 3, True),
                 Point(50, 50, 3, True),
-                Point(50, 100, 3),
+                Point(50, 100, 3, True),
             ]
         )
         samples = sample_stroke(stroke)
@@ -142,6 +142,55 @@ class GeometryTests(unittest.TestCase):
         length_after = math.hypot(*after)
         cosine = (before[0] * after[0] + before[1] * after[1]) / (length_before * length_after)
         self.assertGreater(cosine, 0.99)
+
+    def test_corner_starts_a_straight_run(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(50, 50, 2, True), Point(100, 0, 2, True)])
+        samples = sample_stroke(stroke)
+        # A sharp start goes straight to the next point, rounding resumes after it.
+        self.assertEqual(samples[1][:2], (50.0, 50.0))
+        self.assertGreater(len(samples), 3)
+
+    def test_straight_run_passes_through_the_smooth_point(self) -> None:
+        stroke = Stroke([Point(0, 0, 2), Point(50, 0, 2, True), Point(50, 50, 2, True)])
+        samples = sample_stroke(stroke)
+        self.assertEqual(samples[1][:2], (50.0, 0.0))
+        # The curve leaves the smooth point along the straight run: no kink.
+        first, second = samples[1], samples[2]
+        slope = abs(second[1] - first[1]) / max(1e-9, abs(second[0] - first[0]))
+        self.assertLess(slope, 0.1)
+
+    def test_no_kink_at_smooth_points(self) -> None:
+        stroke = Stroke(
+            [
+                Point(0, 0, 2),
+                Point(40, 0, 2, True),
+                Point(80, 10, 2, True),
+                Point(120, 40, 2),
+                Point(150, 90, 2, True),
+                Point(140, 160, 2, True),
+            ]
+        )
+        samples = sample_stroke(stroke)
+        for index in range(1, len(stroke.points) - 1):
+            point = stroke.points[index]
+            if not point.smooth:
+                continue
+            near = min(
+                range(1, len(samples) - 1),
+                key=lambda i: math.hypot(samples[i][0] - point.x, samples[i][1] - point.y),
+            )
+            before = (
+                samples[near][0] - samples[near - 1][0],
+                samples[near][1] - samples[near - 1][1],
+            )
+            after = (
+                samples[near + 1][0] - samples[near][0],
+                samples[near + 1][1] - samples[near][1],
+            )
+            length_before = math.hypot(*before)
+            length_after = math.hypot(*after)
+            cosine = (before[0] * after[0] + before[1] * after[1]) / (length_before * length_after)
+            self.assertGreater(cosine, 0.999, f"kink at smooth point {index}")
 
     def test_nearest_point(self) -> None:
         stroke = Stroke([Point(0, 0, 1), Point(10, 0, 1)])

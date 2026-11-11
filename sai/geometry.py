@@ -69,20 +69,32 @@ def _circle_tangents(points: list[Point]) -> list[Vector | None]:
     return tangents
 
 
-def _segment_tangent(
+def _segment_tangents(
     points: list[Point],
     circle_tangents: list[Vector | None],
     index: int,
-    chord: Vector,
-) -> Vector:
-    """Tangent used by the segment on the given side of a point."""
-    count = len(points)
-    follows_arc = points[index].smooth or index in (0, count - 1)
-    if follows_arc:
-        tangent = circle_tangents[index]
-        if tangent is not None:
-            return tangent
-    return chord
+    chord_unit: Vector,
+) -> tuple[Vector, Vector]:
+    """Tangents (start, end) for the segment ``index -> index+1``.
+
+    A tangent is shared by the two segments meeting at a smooth point, so the
+    curve never kinks there. When the incoming segment was a straight run from a
+    sharp point, the shared tangent is that run's direction: the line passes
+    through the point and only then starts to bend.
+    """
+    start = points[index]
+    end = points[index + 1]
+    if index > 0 and not points[index - 1].smooth:
+        previous = points[index - 1]
+        t1 = _unit(start.x - previous.x, start.y - previous.y) or chord_unit
+    else:
+        t1 = circle_tangents[index] or chord_unit
+    if end.smooth:
+        t2 = circle_tangents[index + 1] or chord_unit
+    else:
+        # Sharp end: the arc arrives along its chord, so the corner stays sharp.
+        t2 = chord_unit
+    return t1, t2
 
 
 def _hermite(p1: Point, p2: Point, m1: Vector, m2: Vector, t: float) -> tuple[float, float]:
@@ -133,22 +145,25 @@ def _segment_curve(
     chord_length = math.hypot(*chord)
     chord_unit = _unit(*chord) or (0.0, 0.0)
 
-    # Every segment with a smooth endpoint follows a circular arc.
-    if not (start.smooth or end.smooth) or chord_length < EPSILON:
+    # A corner starts a straight run: from a sharp point the line goes straight
+    # to the next point, rounding resumes only after it.
+    if not start.smooth or chord_length < EPSILON:
         return _straight_samples(start, end, chord_length, min_step, max_steps, dense)
 
-    t1 = _segment_tangent(points, circle_tangents, index, chord_unit)
-    t2 = _segment_tangent(points, circle_tangents, index + 1, chord_unit)
+    t1, t2 = _segment_tangents(points, circle_tangents, index, chord_unit)
 
     dot = max(-1.0, min(1.0, t1[0] * t2[0] + t1[1] * t2[1]))
     cross = t1[0] * t2[1] - t1[1] * t2[0]
     theta = abs(math.atan2(cross, dot))
-    if theta < 1e-4 or math.sin(theta / 2.0) < 1e-6:
-        return _straight_samples(start, end, chord_length, min_step, max_steps, dense)
-
-    # Cubic Bezier approximation of a circular arc: handle = 4*tan(theta/4)*R.
-    radius = chord_length / (2.0 * math.sin(theta / 2.0))
-    handle = 4.0 * math.tan(theta / 4.0) * radius
+    if math.sin(theta / 2.0) < 1e-6:
+        # Parallel tangents: a circular arc would degenerate, but a plain chord
+        # would kink against the neighbouring segment. Keep a Hermite that
+        # leaves and arrives along the tangents.
+        handle = chord_length / 3.0
+    else:
+        # Cubic Bezier approximation of a circular arc: handle = 4*tan(theta/4)*R.
+        radius = chord_length / (2.0 * math.sin(theta / 2.0))
+        handle = 4.0 * math.tan(theta / 4.0) * radius
     m1 = (t1[0] * handle, t1[1] * handle)
     m2 = (t2[0] * handle, t2[1] * handle)
 
@@ -170,10 +185,11 @@ def sample_stroke(
 ) -> list[Sample]:
     """Turn a stroke into a dense polyline of (x, y, width).
 
-    Every point, endpoints included, takes its tangent from the circle through it
-    and its two neighbours; each segment is a cubic approximation of that arc. A
-    sharp point uses the chord on its side, so it stays a corner. There are no
-    straight end segments and no user-facing roundness parameter.
+    A segment leaving a sharp point is a straight chord: the corner ends the
+    straight run and rounding resumes after the next point. Every other segment
+    is a circular arc; its tangent comes from the circle through the point and
+    its two neighbours (endpoints included), falling back to the chord when the
+    point is sharp. No user-facing roundness parameter.
     """
     points = stroke.points
     if not points:

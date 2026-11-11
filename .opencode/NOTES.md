@@ -12,10 +12,17 @@
 - `sai/model.py` — `Point(x, y, width, smooth)`, `Stroke`, `Layer`, `Mask`, `Document`. JSON is the
   master format: `{"format": "sai-lineart", "version": 2, ...}` (version 1 loads and migrates).
 - `sai/geometry.py` — `sample_stroke()` turns points into `(x, y, width)` samples.
-  Every point, endpoints included, takes the circle tangent through itself and its two
-  neighbours; each segment is a cubic circular-arc approximation
-  (`handle = 4*tan(theta/4)*R`). A sharp point uses the chord on its side. Three points
-  with a smooth middle form a semicircle. No straight sections, no roundness parameter.
+  A segment that starts at a sharp point is a straight chord: the corner ends the straight
+  run, rounding resumes only after the next point (rule "B", user choice 2026-11-11).
+  Every other segment is a cubic circular-arc approximation (`handle = 4*tan(theta/4)*R`)
+  whose tangent comes from the circle through the point and its two neighbours (endpoints
+  included); a sharp point falls back to the chord on its own side of that arc.
+  The tangent at a smooth point is shared by both segments (`_segment_tangents`), and when
+  the incoming segment was a straight run the shared tangent is that run's direction — so
+  the line passes through a smooth point and only then bends, never kinking there.
+  Parallel end tangents keep the Hermite (`handle = chord/3`) instead of collapsing to the
+  chord, otherwise the join would kink.
+  Three smooth points form a semicircle. No roundness parameter.
 - `sai/render.py` — QPainter: one round-capped line per sample pair, width averaged per pair.
   No polygon offsetting, so no self-intersection artifacts.
 - `sai/io.py` — JSON save/load, PNG export (transparent, scale), SVG export.

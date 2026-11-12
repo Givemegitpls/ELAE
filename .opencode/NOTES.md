@@ -95,6 +95,16 @@
 - Rendering is recursive (`render._draw_stack`): a group draws its children into the current
   painter, and `_apply_composition()` **multiplies** `painter.opacity()` by the node's
   opacity — otherwise a group opacity would be overwritten by its children's 1.0.
+- Clip is an alpha operation: `render._clip_mask()` renders the base content into a
+  cropped mask (bbox from `silhouette.node_bounds`, +1 px AA), at
+  `_mask_scale()` = `max(1, target)` capped by `MAX_MASK_PIXELS = 8M`; `draw_document(scale=)`
+  is fed `zoom × devicePixelRatio` from `Canvas.paintEvent` and `scale` from `export_png`, so
+  clipped layers are not upscaled from document resolution. Masks are cached in
+  `_MASK_CACHE` keyed by `(id(document), uid, _node_signature, scale, bounds, document size)`;
+  `skip_stroke` (live preview) bypasses the cache. The base itself is drawn directly, only
+  clipped siblings go through `_render_masked()`; the mask is composed in device pixels
+  (`resetTransform`), and `inside` needs a buffer-sized mask copy so pixels outside the mask
+  rect are cleared too.
 - `visible=False` skips painting a node but **keeps it in the clip logic**: a hidden base is
   still rendered to its stencil buffer and masks its clipped siblings, and a hidden group
   base still clips. That is how a mask layer is hidden while staying a mask; only the
@@ -106,8 +116,12 @@
 - Masks were removed (v3): no `Document.masks`, `MaskTerm`, `Layer.mask_id`. A stencil is now
   a PNG layer (File > Import PNG as Layer) used with `clip`, or a group. Legacy `"masks"`/
   `"mask_id"` keys in old JSON are ignored; `"clip": true` still loads as `"inside"`.
-- SVG export recurses groups into nested `<g>` (opacity/blend on the group tag); clip is not
-  expressed in SVG, as before.
+- SVG export recurses groups into nested `<g>` (opacity/blend on the group tag) and expresses
+  clip: `<clipPath clipPathUnits="userSpaceOnUse">` with the flattened silhouette
+  (`silhouette.outline_path`, `outside` = page path `.subtracted(path.simplified())`) when the
+  base is opaque, otherwise `<mask>` with `mask-type="alpha"` (`"luminance"` + white rect +
+  black mono content for `outside`). A hidden base is emitted inside the definitions only.
+  Raster layers export as `<image>` with a PNG data URI.
 
 ## Vector fills and scope switch
 - `Stroke.uid` / `Layer.uid` (uuid hex) are stable references; they survive copy and are

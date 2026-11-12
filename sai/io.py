@@ -6,9 +6,10 @@ import json
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath
 
+from . import silhouette
 from .geometry import sample_stroke
 from .model import Document, Layer
 from .render import draw_document
@@ -66,7 +67,7 @@ def export_png(
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.scale(scale, scale)
-    draw_document(painter, document, background=background)
+    draw_document(painter, document, background=background, scale=scale)
     painter.end()
 
     if not image.save(str(path)):
@@ -74,63 +75,167 @@ def export_png(
 
 
 def export_svg(document: Document, path: str | Path) -> None:
-    parts: list[str] = [
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        (
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{document.width}" '
-            f'height="{document.height}" viewBox="0 0 {document.width} {document.height}">'
-        ),
-    ]
+    """Write the document as SVG; clip becomes ``clipPath`` (opaque) or ``mask``."""
+    width = document.width
+    height = document.height
+    body: list[str] = []
+    defs: list[str] = []
+    counter = 0
 
-    def emit(items: list[Layer], depth: int) -> None:
+    def stroke_markup(layer: Layer, depth: int, mono: str | None) -> list[str]:
         indent = "  " * depth
-        for layer in items:
-            if not layer.visible:
+        lines: list[str] = []
+        if layer.kind == "raster" and layer.image_base64:
+            lines.append(
+                f'{indent}<image x="0" y="0" width="{width}" height="{height}" '
+                f'href="data:image/png;base64,{layer.image_base64}"/>'
+            )
+        for stroke in layer.strokes:
+            color = mono or "#{:02x}{:02x}{:02x}".format(*stroke.color)
+            alpha = 1.0 if mono is not None else stroke.alpha / 255
+            samples = sample_stroke(stroke)
+            if stroke.fill is not None and len(samples) > 2:
+                loop = [(x, y) for x, y, _w in samples]
+                fill = mono or "#{:02x}{:02x}{:02x}".format(*stroke.fill)
+                fill_alpha = 1.0 if mono is not None else stroke.fill_alpha / 255
+                lines.append(
+                    f'{indent}<path d="{_svg_path([loop])}" fill="{fill}" '
+                    f'fill-opacity="{fill_alpha:.3f}" fill-rule="evenodd"/>'
+                )
+            if len(samples) == 1:
+                x, y, stroke_width = samples[0]
+                if stroke_width <= 0.01:
+                    continue
+                radius = max(stroke_width, 0.5) / 2
+                lines.append(
+                    f'{indent}<circle cx="{x:.2f}" cy="{y:.2f}" r="{radius:.2f}" '
+                    f'fill="{color}" fill-opacity="{alpha:.3f}"/>'
+                )
                 continue
-            style = ""
+            for (x1, y1, w1), (x2, y2, w2) in itertools.pairwise(samples):
+                stroke_width = (w1 + w2) / 2
+                if stroke_width <= 0.01:
+                    continue
+                lines.append(
+                    f'{indent}<line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" '
+                    f'stroke="{color}" stroke-opacity="{alpha:.3f}" '
+                    f'stroke-width="{stroke_width:.2f}" stroke-linecap="round"/>'
+                )
+        return lines
+
+    def node_markup(
+        layer: Layer, depth: int, extra: str = "", mono: str | None = None
+    ) -> list[str]:
+        indent = "  " * depth
+        style = ""
+        if mono is None:
             if layer.opacity < 1.0:
-                style = f' opacity="{layer.opacity:.3f}"'
+                style += f' opacity="{layer.opacity:.3f}"'
             if layer.blend == "multiply":
                 style += ' style="mix-blend-mode:multiply"'
-            parts.append(f'{indent}<g id="{_escape(layer.name)}"{style}>')
-            if layer.is_group:
-                emit(layer.children, depth + 1)
-            for stroke in layer.strokes:
-                color = "#{:02x}{:02x}{:02x}".format(*stroke.color)
-                alpha = stroke.alpha / 255
-                samples = sample_stroke(stroke)
-                if stroke.fill is not None and len(samples) > 2:
-                    loop = [(x, y) for x, y, _width in samples]
-                    parts.append(
-                        f'{indent}  <path d="{_svg_path([loop])}" '
-                        f'fill="#{stroke.fill[0]:02x}{stroke.fill[1]:02x}{stroke.fill[2]:02x}" '
-                        f'fill-opacity="{stroke.fill_alpha / 255:.3f}"/>'
-                    )
-                if len(samples) == 1:
-                    x, y, width = samples[0]
-                    if width <= 0.01:
-                        continue
-                    radius = max(width, 0.5) / 2
-                    parts.append(
-                        f'{indent}  <circle cx="{x:.2f}" cy="{y:.2f}" r="{radius:.2f}" '
-                        f'fill="{color}" fill-opacity="{alpha:.3f}"/>'
-                    )
-                    continue
-                for (x1, y1, w1), (x2, y2, w2) in itertools.pairwise(samples):
-                    width = (w1 + w2) / 2
-                    if width <= 0.01:
-                        continue
-                    parts.append(
-                        f'{indent}  <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" '
-                        f'stroke="{color}" stroke-opacity="{alpha:.3f}" '
-                        f'stroke-width="{width:.2f}" stroke-linecap="round"/>'
-                    )
-            parts.append(f"{indent}</g>")
+        lines = [f'{indent}<g id="{_escape(layer.name)}"{style}{extra}>']
+        if layer.is_group:
+            lines += stack_markup(layer.children, depth + 1, mono)
+        else:
+            lines += stroke_markup(layer, depth + 1, mono)
+        lines.append(f"{indent}</g>")
+        return lines
 
-    emit(document.layers, 1)
+    def mask_markup(base: Layer, invert: bool) -> str:
+        nonlocal counter
+        identifier = f"mask{counter}"
+        counter += 1
+        inner: list[str] = []
+        if invert:
+            inner.append(f'    <rect x="0" y="0" width="{width}" height="{height}" fill="white"/>')
+            inner += node_markup(base, 2, mono="black")
+            kind = "luminance"
+        else:
+            inner += node_markup(base, 2)
+            kind = "alpha"
+        defs.append(
+            f'  <mask id="{identifier}" mask-type="{kind}" maskUnits="userSpaceOnUse" '
+            f'x="0" y="0" width="{width}" height="{height}">\n' + "\n".join(inner) + "\n  </mask>"
+        )
+        return f' mask="url(#{identifier})"'
 
+    def clip_markup(base: Layer, outside: bool) -> str:
+        nonlocal counter
+        identifier = f"clip{counter}"
+        counter += 1
+        path = silhouette.outline_path(base)
+        if outside:
+            page = QPainterPath()
+            page.addRect(QRectF(0, 0, width, height))
+            path = page.subtracted(path.simplified())
+        flat = _path_data(path)
+        defs.append(
+            f'  <clipPath id="{identifier}" clipPathUnits="userSpaceOnUse">\n'
+            f'    <path d="{flat}" clip-rule="nonzero"/>\n'
+            f"  </clipPath>"
+        )
+        return f' clip-path="url(#{identifier})"'
+
+    def clipped_markup(base: Layer, clipped: list[Layer], depth: int) -> list[str]:
+        lines: list[str] = []
+        for item in clipped:
+            if not item.visible:
+                continue
+            outside = item.clip == "outside"
+            if silhouette.is_opaque(base):
+                attribute = clip_markup(base, outside)
+            else:
+                attribute = mask_markup(base, outside)
+            lines += node_markup(item, depth, extra=attribute)
+        return lines
+
+    def stack_markup(items: list[Layer], depth: int, mono: str | None = None) -> list[str]:
+        lines: list[str] = []
+        index = 0
+        while index < len(items):
+            layer = items[index]
+            clipped: list[Layer] = []
+            cursor = index + 1
+            while cursor < len(items) and items[cursor].clip != "off":
+                clipped.append(items[cursor])
+                cursor += 1
+            if layer.visible:
+                lines += node_markup(layer, depth, mono=mono)
+            if clipped:
+                lines += clipped_markup(layer, clipped, depth)
+            index = cursor
+        return lines
+
+    body += stack_markup(document.layers, 1)
+
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height}" viewBox="0 0 {width} {height}">'
+        ),
+    ]
+    if defs:
+        parts.append("  <defs>")
+        parts += defs
+        parts.append("  </defs>")
+    parts += body
     parts.append("</svg>")
     Path(path).write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+
+def _path_data(path: QPainterPath) -> str:
+    """Flatten a painter path into SVG path data (polygons only)."""
+    parts: list[str] = []
+    for polygon in path.toSubpathPolygons():
+        if polygon.size() < 3:
+            continue
+        points = " L ".join(
+            f"{polygon.at(index).x():.2f} {polygon.at(index).y():.2f}"
+            for index in range(polygon.size())
+        )
+        parts.append(f"M {points} Z")
+    return " ".join(parts)
 
 
 def _svg_path(loops: list[list[tuple[float, float]]]) -> str:

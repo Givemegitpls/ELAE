@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,6 +15,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QAbstractItemView, QApplication
 
 from sai import fill, io, transform
+from sai import render as render_module
 from sai.app import MainWindow
 from sai.canvas import Canvas
 from sai.geometry import nearest_point, nearest_segment, sample_stroke
@@ -292,6 +294,55 @@ class DocumentTests(unittest.TestCase):
             loaded = io.load_document(path)
         self.assertTrue(loaded.layers[0].strokes[0].closed)
         self.assertFalse(loaded.layers[0].strokes[1].closed)
+
+    def _clip_document(self, base_alpha: int = 255, clip: str = "inside") -> Document:
+        document = Document(60, 60)
+        base = Layer("base", [Stroke([Point(30, 30, 20)], alpha=base_alpha)])
+        band = Layer(
+            "band",
+            [Stroke([Point(10, 30, 10), Point(50, 30, 10)], (255, 0, 0))],
+            clip=clip,
+        )
+        document.layers = [base, band]
+        return document
+
+    def test_svg_clip_uses_clip_path_for_an_opaque_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "clip.svg"
+            io.export_svg(self._clip_document(), path)
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("<clipPath", text)
+        self.assertIn('clip-path="url(#clip0)"', text)
+        self.assertIn('clip-rule="nonzero"', text)
+        self.assertNotIn("<mask", text)
+
+    def test_svg_clip_uses_a_mask_for_a_soft_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "soft.svg"
+            io.export_svg(self._clip_document(base_alpha=128), path)
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("<mask", text)
+        self.assertIn('mask-type="alpha"', text)
+        self.assertIn('mask="url(#mask0)"', text)
+
+    def test_svg_clip_outside_inverts_the_mask(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "outside.svg"
+            io.export_svg(self._clip_document(base_alpha=128, clip="outside"), path)
+            text = path.read_text(encoding="utf-8")
+        self.assertIn('mask-type="luminance"', text)
+        self.assertIn('fill="white"', text)
+
+    def test_svg_hidden_base_still_defines_the_clip(self) -> None:
+        document = self._clip_document()
+        document.layers[0].visible = False
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hidden.svg"
+            io.export_svg(document, path)
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("<clipPath", text)
+        self.assertIn('clip-path="url(#clip0)"', text)
+        self.assertNotIn('<g id="base">', text)
 
     def test_svg_export_nests_groups(self) -> None:
         document = Document(40, 40)
@@ -641,6 +692,59 @@ class RenderTests(unittest.TestCase):
         index = document.insert_below(child, new_layer)
         self.assertEqual([item.name for item in group.children], ["new", "child"])
         self.assertEqual(index, document.walk_index(new_layer))
+
+    def test_clip_mask_uses_the_target_scale(self) -> None:
+        render_module._MASK_CACHE.clear()
+        document = Document(80, 80)
+        base = Layer("base", [Stroke([Point(40, 40, 20)])])
+        band = Layer(
+            "band", [Stroke([Point(10, 40, 10), Point(70, 40, 10)], (255, 0, 0))], clip="inside"
+        )
+        document.layers = [base, band]
+        low = render_module._clip_mask(document, base, None, 1.0)
+        high = render_module._clip_mask(document, base, None, 4.0)
+        assert low is not None and high is not None
+        self.assertGreater(high[2], low[2])
+        self.assertGreater(high[0].width(), low[0].width())
+
+    def test_clip_mask_is_cached_between_frames(self) -> None:
+        render_module._MASK_CACHE.clear()
+        document = Document(80, 80)
+        base = Layer("base", [Stroke([Point(40, 40, 20)])])
+        band = Layer(
+            "band", [Stroke([Point(10, 40, 10), Point(70, 40, 10)], (255, 0, 0))], clip="inside"
+        )
+        document.layers = [base, band]
+        original = render_module._draw_node
+        seen: list[Layer] = []
+
+        def counter(painter, layer, *args, **kwargs):
+            if kwargs.get("composed") is False:
+                seen.append(layer)
+            return original(painter, layer, *args, **kwargs)
+
+        with mock.patch.object(render_module, "_draw_node", side_effect=counter):
+            self._render(document)
+            first = sum(1 for layer in seen if layer is base)
+            seen.clear()
+            self._render(document)
+            second = sum(1 for layer in seen if layer is base)
+        self.assertGreater(first, 0)
+        self.assertEqual(second, 0)
+
+    def test_clip_mask_is_rebuilt_during_a_live_stroke(self) -> None:
+        render_module._MASK_CACHE.clear()
+        document = Document(80, 80)
+        base = Layer("base", [Stroke([Point(40, 40, 20)])])
+        band = Layer(
+            "band", [Stroke([Point(10, 40, 10), Point(70, 40, 10)], (255, 0, 0))], clip="inside"
+        )
+        document.layers = [base, band]
+        live = Stroke([Point(20, 20, 4), Point(30, 30, 4)])
+        before = len(render_module._MASK_CACHE)
+        render_module._clip_mask(document, base, live, 1.0)
+        render_module._clip_mask(document, base, live, 1.0)
+        self.assertEqual(len(render_module._MASK_CACHE), before)
 
     def test_clip_roundtrip(self) -> None:
         document = Document(64, 64)

@@ -318,6 +318,7 @@ class Canvas(QWidget):
             self.doc,
             background=None,
             skip_stroke=self._active_stroke if preview is not None else None,
+            scale=self.zoom * self.devicePixelRatioF(),
         )
         self._draw_overlay(painter)
 

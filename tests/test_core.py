@@ -11,14 +11,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QAbstractItemView, QApplication
 
 from sai import fill, io, transform
 from sai.app import MainWindow
 from sai.canvas import Canvas
 from sai.geometry import nearest_point, nearest_segment, sample_stroke
 from sai.model import Document, Layer, Point, Stroke
-from sai.render import draw_document, layer_image
+from sai.render import draw_document, layer_image, stroke_path
 
 
 def _bow_depth(stroke: Stroke) -> float:
@@ -293,6 +293,43 @@ class DocumentTests(unittest.TestCase):
         self.assertTrue(loaded.layers[0].strokes[0].closed)
         self.assertFalse(loaded.layers[0].strokes[1].closed)
 
+    def test_svg_export_nests_groups(self) -> None:
+        document = Document(40, 40)
+        inner = Layer("inner", [Stroke([Point(10, 10, 3), Point(30, 30, 3)])])
+        document.layers = [document.make_group("group", [inner])]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "group.svg"
+            io.export_svg(document, path)
+            text = path.read_text(encoding="utf-8")
+        self.assertIn('<g id="group">', text)
+        self.assertIn('  <g id="inner">', text)
+        self.assertIn("</g>\n  </g>", text.replace("\r\n", "\n"))
+
+    def test_svg_export_draws_vector_fills(self) -> None:
+        document = Document(40, 40)
+        document.layers[0].strokes.append(
+            Stroke(
+                [Point(10, 10, 0), Point(30, 10, 0), Point(30, 30, 0), Point(10, 30, 0)],
+                closed=True,
+                fill=(255, 0, 0),
+            )
+        )
+        document.layers[0].strokes.append(
+            Stroke(
+                [Point(4, 4, 0), Point(34, 4, 0), Point(34, 34, 0), Point(4, 34, 0)],
+                closed=True,
+                fill=(0, 0, 255),
+                fill_alpha=128,
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fill.svg"
+            io.export_svg(document, path)
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("#0000ff", text)
+        self.assertIn("#ff0000", text)
+        self.assertIn('fill-opacity="0.502"', text)
+
     def test_svg_export(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "drawing.svg"
@@ -362,7 +399,7 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(decoded.width(), 32)
 
 
-class RenderMaskTests(unittest.TestCase):
+class RenderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
@@ -375,6 +412,67 @@ class RenderMaskTests(unittest.TestCase):
         painter.end()
         return image
 
+    def test_stroke_fill_paints_the_closed_shape(self) -> None:
+        document = Document(40, 40)
+        document.layers = [
+            Layer(
+                "shape",
+                [
+                    Stroke(
+                        [Point(10, 10, 0), Point(30, 10, 0), Point(30, 30, 0), Point(10, 30, 0)],
+                        closed=True,
+                        fill=(255, 0, 0),
+                    )
+                ],
+            )
+        ]
+        image = self._render(document)
+        self.assertGreater(image.pixelColor(20, 20).red(), 200)
+        self.assertEqual(image.pixelColor(2, 2).alpha(), 0)
+
+    def test_group_opacity_applies_to_children(self) -> None:
+        document = Document(40, 40)
+        child = Layer("child", [Stroke([Point(20, 20, 20)])])
+        group = document.make_group("group", [child])
+        group.opacity = 0.5
+        document.layers = [group]
+        image = self._render(document)
+        alpha = image.pixelColor(20, 20).alpha()
+        self.assertGreater(alpha, 90)
+        self.assertLess(alpha, 180)
+
+    def test_clip_uses_sibling_inside_a_group(self) -> None:
+        document = Document(60, 60)
+        base = Layer("base", [Stroke([Point(30, 30, 30)], (0, 0, 0))])
+        clipped = Layer(
+            "clipped",
+            [Stroke([Point(10, 30, 10), Point(50, 30, 10)], (255, 0, 0))],
+            clip="inside",
+        )
+        document.layers = [document.make_group("group", [base, clipped])]
+        image = self._render(document)
+        inside = image.pixelColor(30, 30)
+        self.assertEqual((inside.red(), inside.green(), inside.blue()), (255, 0, 0))
+        outside = image.pixelColor(10, 30)
+        self.assertEqual((outside.red(), outside.green(), outside.blue()), (0, 0, 0))
+        self.assertEqual(image.pixelColor(50, 30).alpha(), 0)
+
+    def test_group_can_be_the_clip_base(self) -> None:
+        document = Document(60, 60)
+        group = document.make_group(
+            "group", [Layer("dot", [Stroke([Point(30, 30, 30)], (0, 0, 0))])]
+        )
+        clipped = Layer(
+            "clipped",
+            [Stroke([Point(10, 30, 10), Point(50, 30, 10)], (255, 0, 0))],
+            clip="inside",
+        )
+        document.layers = [group, clipped]
+        image = self._render(document)
+        self.assertEqual(image.pixelColor(10, 30).alpha(), 0)
+        dot = image.pixelColor(30, 30)
+        self.assertEqual((dot.red(), dot.green(), dot.blue()), (255, 0, 0))
+
     def test_clip_to_layer_below(self) -> None:
         document = Document(100, 100)
         document.layers = [
@@ -382,84 +480,145 @@ class RenderMaskTests(unittest.TestCase):
             Layer(
                 "clip",
                 [Stroke([Point(80, 20, 20)]), Stroke([Point(21, 20, 20)])],
-                clip_to_below=True,
+                clip="inside",
             ),
         ]
         image = self._render(document)
         self.assertGreater(image.pixelColor(21, 20).alpha(), 0)
         self.assertEqual(image.pixelColor(80, 20).alpha(), 0)
 
-    def test_layer_mask_uses_alpha(self) -> None:
+    def test_clip_outside_subtracts_the_layer_below(self) -> None:
         document = Document(100, 100)
-        layer = Layer("line", [Stroke([Point(20, 20, 20)]), Stroke([Point(80, 20, 20)])])
-        document.layers = [layer]
-
-        mask = QImage(100, 100, QImage.Format.Format_ARGB32_Premultiplied)
-        mask.fill(Qt.GlobalColor.transparent)
-        mask_painter = QPainter(mask)
-        mask_painter.fillRect(QRectF(0, 0, 50, 100), QColor("white"))
-        mask_painter.end()
-
-        layer.mask_id = document.add_mask("half", io.encode_image(mask))
-
+        document.layers = [
+            Layer("base", [Stroke([Point(20, 20, 20)], (0, 0, 0))]),
+            Layer(
+                "clip",
+                [
+                    Stroke([Point(80, 20, 20)], (255, 0, 0)),
+                    Stroke([Point(21, 20, 20)], (255, 0, 0)),
+                ],
+                clip="outside",
+            ),
+        ]
         image = self._render(document)
-        self.assertGreater(image.pixelColor(20, 20).alpha(), 0)
-        self.assertEqual(image.pixelColor(80, 20).alpha(), 0)
+        # inside the base only the base colour survives, outside the clip shows
+        inside = image.pixelColor(21, 20)
+        self.assertEqual((inside.red(), inside.green(), inside.blue()), (0, 0, 0))
+        outside = image.pixelColor(80, 20)
+        self.assertEqual((outside.red(), outside.green(), outside.blue()), (255, 0, 0))
 
-    def test_one_mask_serves_many_layers(self) -> None:
+    def test_clip_off_draws_everything(self) -> None:
         document = Document(100, 100)
-        left = Layer("left", [Stroke([Point(20, 20, 20)])])
-        right = Layer("right", [Stroke([Point(80, 20, 20)])])
-        document.layers = [left, right]
-
-        mask = QImage(100, 100, QImage.Format.Format_ARGB32_Premultiplied)
-        mask.fill(Qt.GlobalColor.transparent)
-        mask_painter = QPainter(mask)
-        mask_painter.fillRect(QRectF(0, 0, 50, 100), QColor("white"))
-        mask_painter.end()
-
-        mask_id = document.add_mask("left half", io.encode_image(mask))
-        left.mask_id = mask_id
-        right.mask_id = mask_id
-
+        document.layers = [
+            Layer("base", [Stroke([Point(20, 20, 20)])]),
+            Layer("clip", [Stroke([Point(80, 20, 20)])], clip="off"),
+        ]
         image = self._render(document)
-        self.assertGreater(image.pixelColor(20, 20).alpha(), 0)
-        self.assertEqual(image.pixelColor(80, 20).alpha(), 0)
+        self.assertGreater(image.pixelColor(80, 20).alpha(), 0)
 
-    def test_clip_and_mask_roundtrip(self) -> None:
+    def test_walk_lists_groups_with_depth(self) -> None:
+        document = Document(32, 32)
+        inner = Layer("inner")
+        group = document.make_group("group", [inner])
+        document.layers = [group, Layer("top")]
+        self.assertEqual(
+            [(layer.name, depth) for layer, depth in document.walk()],
+            [("group", 0), ("inner", 1), ("top", 0)],
+        )
+        self.assertEqual([layer.name for layer in document.all_layers()], ["inner", "top"])
+
+    def test_group_layer_wraps_and_ungroup_dissolves(self) -> None:
+        document = Document(32, 32)
+        document.layers = [Layer("a"), Layer("b")]
+        group = document.group_layer(document.layers[1])
+        self.assertIsNotNone(group)
+        assert group is not None
+        self.assertEqual(document.layers[0].name, "a")
+        self.assertTrue(document.layers[1].is_group)
+        self.assertIs(document.layers[1].children[0], group.children[0])
+        first = document.ungroup(group)
+        self.assertIsNotNone(first)
+        self.assertEqual([layer.name for layer in document.layers], ["a", "b"])
+
+    def test_move_layers_reorders_and_keeps_order(self) -> None:
+        document = Document(32, 32)
+        document.layers = [Layer("a"), Layer("b"), Layer("c")]
+        a, b, _c = document.layers
+        moved = document.move_layers([a, b], document.layers, 3)
+        self.assertEqual(moved, [a, b])
+        self.assertEqual([layer.name for layer in document.layers], ["c", "a", "b"])
+
+    def test_move_layers_into_and_out_of_a_group(self) -> None:
+        document = Document(32, 32)
+        child = Layer("child")
+        group = document.make_group("group", [child])
+        outside = Layer("outside")
+        document.layers = [group, outside]
+        document.move_layers([outside], group.children, 0)
+        self.assertEqual([layer.name for layer in group.children], ["outside", "child"])
+        document.move_layers([outside], document.layers, len(document.layers))
+        self.assertEqual([layer.name for layer in group.children], ["child"])
+        self.assertEqual([layer.name for layer in document.layers], ["group", "outside"])
+
+    def test_move_layers_refuses_group_into_itself(self) -> None:
+        document = Document(32, 32)
+        inner = Layer("inner")
+        group = document.make_group("group", [inner])
+        document.layers = [group]
+        self.assertEqual(document.move_layers([group], group.children, 0), [])
+        self.assertEqual(group.children, [inner])
+
+    def test_group_layers_wraps_the_whole_selection(self) -> None:
+        document = Document(32, 32)
+        document.layers = [Layer("a"), Layer("b"), Layer("c")]
+        a, b, _c = document.layers
+        group = document.group_layers([a, b])
+        self.assertIsNotNone(group)
+        assert group is not None
+        self.assertEqual([layer.name for layer in group.children], ["a", "b"])
+        self.assertEqual([layer.name for layer in document.layers], ["Group 1", "c"])
+
+    def test_move_selection_keeps_a_block_together(self) -> None:
+        document = Document(32, 32)
+        document.layers = [Layer("a"), Layer("b"), Layer("c")]
+        a, b, _c = document.layers
+        document.move_selection([a, b], 1)
+        self.assertEqual([layer.name for layer in document.layers], ["c", "a", "b"])
+        document.move_selection([a, b], -1)
+        self.assertEqual([layer.name for layer in document.layers], ["a", "b", "c"])
+
+    def test_insert_below_inside_a_group(self) -> None:
+        document = Document(32, 32)
+        child = Layer("child")
+        group = document.make_group("group", [child])
+        document.layers = [group]
+        new_layer = Layer("new")
+        index = document.insert_below(child, new_layer)
+        self.assertEqual([item.name for item in group.children], ["new", "child"])
+        self.assertEqual(index, document.walk_index(new_layer))
+
+    def test_clip_roundtrip(self) -> None:
         document = Document(64, 64)
-        document.layers[0].clip_to_below = True
-        mask_id = document.add_mask("shared", "ZmFrZQ==")
-        document.layers[0].mask_id = mask_id
+        document.layers[0].clip = "outside"
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "doc.json"
             io.save_document(document, path)
             loaded = io.load_document(path)
-        self.assertTrue(loaded.layers[0].clip_to_below)
-        self.assertEqual(loaded.layers[0].mask_id, mask_id)
-        self.assertEqual(loaded.masks[mask_id].image_base64, "ZmFrZQ==")
+        self.assertEqual(loaded.layers[0].clip, "outside")
 
-    def test_legacy_layer_mask_becomes_shared(self) -> None:
+    def test_legacy_clip_boolean_loads_as_inside(self) -> None:
         document = Document.from_dict(
             {
                 "width": 32,
                 "height": 32,
-                "layers": [{"name": "ink", "mask": "ZmFrZQ=="}],
+                "layers": [
+                    {"name": "a", "strokes": []},
+                    {"name": "b", "strokes": [], "clip": True},
+                ],
             }
         )
-        layer = document.layers[0]
-        self.assertIsNotNone(layer.mask_id)
-        assert layer.mask_id is not None
-        self.assertEqual(document.masks[layer.mask_id].image_base64, "ZmFrZQ==")
-        self.assertEqual(document.masks[layer.mask_id].name, "ink mask")
-
-    def test_remove_unused_masks(self) -> None:
-        document = Document(16, 16)
-        used = document.add_mask("used", "ZmFrZQ==")
-        document.add_mask("stale", "ZmFrZQ==")
-        document.layers[0].mask_id = used
-        self.assertEqual(document.remove_unused_masks(), 1)
-        self.assertEqual(list(document.masks), [used])
+        self.assertEqual(document.layers[1].clip, "inside")
+        self.assertEqual(document.layers[0].clip, "off")
 
 
 class TransformTests(unittest.TestCase):
@@ -526,7 +685,7 @@ class FillTests(unittest.TestCase):
 
     def test_bucket_fill_inside_closed_line(self) -> None:
         document = self._document()
-        self.assertTrue(fill.bucket_fill(document, 0, 20, 20, (255, 0, 0), 255))
+        self.assertTrue(fill.bucket_fill(document, document.layers[0], 20, 20, (255, 0, 0), 255))
         image = layer_image(document.layers[0])
         self.assertIsNotNone(image)
         assert image is not None
@@ -537,7 +696,7 @@ class FillTests(unittest.TestCase):
 
     def test_bucket_fill_on_line_does_nothing(self) -> None:
         document = self._document()
-        self.assertFalse(fill.bucket_fill(document, 0, 10, 10, (255, 0, 0), 255))
+        self.assertFalse(fill.bucket_fill(document, document.layers[0], 10, 10, (255, 0, 0), 255))
 
     def test_open_region_uses_canvas_as_boundary(self) -> None:
         document = Document(60, 40)
@@ -548,14 +707,68 @@ class FillTests(unittest.TestCase):
         document.layers = [underlay, Layer("fill", kind="raster"), Layer("line", [line])]
         document.active_layer = 1
 
-        self.assertTrue(fill.bucket_fill(document, 1, 30, 8, (0, 128, 255), 255))
+        self.assertTrue(fill.bucket_fill(document, document.layers[1], 30, 8, (0, 128, 255), 255))
         image = layer_image(document.layers[1])
         self.assertIsNotNone(image)
         assert image is not None
         self.assertGreater(image.pixelColor(30, 8).alpha(), 0)
         self.assertEqual(image.pixelColor(30, 32).alpha(), 0)
 
-    def test_fill_tool_creates_raster_layer(self) -> None:
+    def test_convert_vector_to_fill(self) -> None:
+        canvas = Canvas(Document(40, 40))
+        stroke = Stroke([Point(10, 10, 4), Point(30, 10, 4), Point(30, 30, 4)])
+        canvas.doc.layer().strokes.append(stroke)
+        canvas.color = (0, 0, 255)
+        canvas.alpha = 200
+        self.assertTrue(canvas.convert_to_fill())
+        self.assertEqual(len(canvas.doc.layers), 2)
+        fill_layer = canvas.doc.layer()
+        self.assertEqual(fill_layer.kind, "vector")
+        self.assertIs(fill_layer, canvas.doc.layers[0])
+        converted = fill_layer.strokes[0]
+        self.assertTrue(converted.closed)
+        self.assertEqual(converted.fill, (0, 0, 255))
+        self.assertEqual(converted.fill_alpha, 200)
+        self.assertTrue(all(point.width == 0.0 for point in converted.points))
+        # the source layer is untouched and sits above the fill
+        self.assertIs(canvas.doc.layers[1].strokes[0], stroke)
+        self.assertEqual(stroke.closed, False)
+
+    def test_scope_image_reaches_other_layers(self) -> None:
+        canvas = Canvas(Document(60, 60))
+        first = Stroke([Point(10, 10, 3), Point(50, 10, 3)])
+        canvas.doc.layers[0].strokes.append(first)
+        canvas.doc.layers.append(Layer("top", [Stroke([Point(10, 50, 3), Point(50, 50, 3)])]))
+        canvas.doc.active_layer = 1
+        canvas.tool = Canvas.TOOL_EDIT
+        self.assertIsNone(canvas._find_point(QPointF(10, 10))[0])
+        canvas.set_scope("image")
+        self.assertIs(canvas._find_point(QPointF(10, 10))[0], first)
+
+    def test_filled_stroke_and_group_roundtrip(self) -> None:
+        document = Document(60, 60)
+        line = Stroke([Point(10, 10, 3), Point(50, 10, 3), Point(50, 50, 3), Point(10, 50, 3)])
+        document.layers[0].strokes.append(line)
+        filled = Stroke(
+            [Point(10, 10, 0), Point(50, 10, 0), Point(50, 50, 0)], closed=True, fill=(0, 0, 255)
+        )
+        filled.fill_alpha = 200
+        document.layers.insert(0, Layer("fill", strokes=[filled]))
+        group = document.make_group("group", [document.layers[0], document.layers[1]])
+        document.layers = [group]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vector.json"
+            io.save_document(document, path)
+            loaded = io.load_document(path)
+        self.assertTrue(loaded.layers[0].is_group)
+        self.assertEqual(len(loaded.layers[0].children), 2)
+        loaded_fill = loaded.layers[0].children[0].strokes[0]
+        self.assertTrue(loaded_fill.closed)
+        self.assertEqual(loaded_fill.fill, (0, 0, 255))
+        self.assertEqual(loaded_fill.fill_alpha, 200)
+        self.assertEqual(loaded.layers[0].children[1].uid, document.layers[0].children[1].uid)
+
+    def test_fill_tool_on_raster_creates_fill_layer(self) -> None:
         canvas = Canvas(Document(40, 40))
         stroke = Stroke(
             [
@@ -566,7 +779,9 @@ class FillTests(unittest.TestCase):
                 Point(10, 10, 3),
             ]
         )
-        canvas.doc.layer().strokes.append(stroke)
+        canvas.doc.layers.insert(0, Layer("fill", kind="raster"))
+        canvas.doc.layers[1].strokes.append(stroke)
+        canvas.doc.active_layer = 0
         canvas.tool = Canvas.TOOL_FILL
         canvas.color = (0, 0, 255)
         canvas._fill_click(QPointF(20, 20))
@@ -575,6 +790,155 @@ class FillTests(unittest.TestCase):
         self.assertIsNotNone(image)
         assert image is not None
         self.assertGreater(image.pixelColor(20, 20).alpha(), 0)
+
+    def test_bucket_fill_inside_a_group(self) -> None:
+        document = Document(40, 40)
+        square = Stroke(
+            [
+                Point(10, 10, 3),
+                Point(30, 10, 3),
+                Point(30, 30, 3),
+                Point(10, 30, 3),
+                Point(10, 10, 3),
+            ],
+            closed=True,
+        )
+        raster = Layer("fill", kind="raster")
+        document.layers = [document.make_group("group", [raster, Layer("line", [square])])]
+        self.assertTrue(fill.bucket_fill(document, raster, 20, 20, (255, 0, 0), 255))
+        image = layer_image(raster)
+        self.assertIsNotNone(image)
+        assert image is not None
+        self.assertGreater(image.pixelColor(20, 20).alpha(), 0)
+        self.assertEqual(image.pixelColor(2, 2).alpha(), 0)
+
+    def test_fill_duplicates_inside_the_group(self) -> None:
+        document = Document(40, 40)
+        line = Stroke([Point(10, 10, 3), Point(30, 10, 3), Point(30, 30, 3), Point(10, 30, 3)])
+        source = Layer("source", [line])
+        group = document.make_group("group", [source])
+        document.layers = [group]
+        document.active_layer = document.walk_index(source)
+        canvas = Canvas(document)
+        canvas.tool = Canvas.TOOL_FILL
+        canvas._fill_click(QPointF(20, 20))
+        self.assertEqual(len(group.children), 2)
+        self.assertEqual(len(document.layers), 1)
+        self.assertEqual(group.children[0].name, "Fill 2")
+        self.assertIs(group.children[1], source)
+        self.assertIsNone(line.fill)
+
+    def test_fill_marks_the_stroke_under_the_cursor(self) -> None:
+        canvas = Canvas(Document(40, 40))
+        line = Stroke([Point(10, 10, 3), Point(30, 10, 3), Point(30, 30, 3), Point(10, 30, 3)])
+        canvas.doc.layer().strokes.append(line)
+        canvas.tool = Canvas.TOOL_FILL
+        canvas.color = (0, 0, 255)
+        canvas._fill_click(QPointF(20, 20))
+        self.assertEqual(len(canvas.doc.layers), 2)
+        self.assertEqual(canvas.doc.active_layer, 0)
+        fill_layer = canvas.doc.layers[0]
+        self.assertEqual(fill_layer.name, "Fill 1")
+        self.assertIs(canvas.doc.layers[1].strokes[0], line)
+        # the source stays untouched, the fill lives on the duplicated layer
+        self.assertIsNone(line.fill)
+        self.assertFalse(line.bridge)
+        copy = fill_layer.strokes[0]
+        self.assertIsNot(copy, line)
+        self.assertNotEqual(copy.uid, line.uid)
+        self.assertEqual(copy.fill, (0, 0, 255))
+        self.assertEqual(copy.fill_alpha, 255)
+        self.assertTrue(copy.bridge)
+        self.assertFalse(copy.closed)
+
+    def test_fill_bridge_is_a_straight_segment(self) -> None:
+        canvas = Canvas(Document(40, 40))
+        line = Stroke([Point(10, 10, 3), Point(30, 10, 3), Point(30, 30, 3), Point(10, 30, 3)])
+        canvas.doc.layer().strokes.append(line)
+        canvas.tool = Canvas.TOOL_FILL
+        canvas._fill_click(QPointF(20, 20))
+        samples = sample_stroke(canvas.doc.layers[0].strokes[0])
+        # the last sample returns to the first point: one straight bridge
+        self.assertAlmostEqual(samples[-1][0], samples[0][0])
+        self.assertAlmostEqual(samples[-1][1], samples[0][1])
+
+    def test_fill_follows_point_edits(self) -> None:
+        canvas = Canvas(Document(40, 40))
+        line = Stroke([Point(10, 10, 3), Point(30, 10, 3), Point(30, 30, 3), Point(10, 30, 3)])
+        canvas.doc.layer().strokes.append(line)
+        canvas.tool = Canvas.TOOL_FILL
+        canvas._fill_click(QPointF(20, 20))
+        filled = canvas.doc.layers[0].strokes[0]
+        before = stroke_path(filled).boundingRect()
+        filled.points[1].x = 36.0
+        after = stroke_path(filled).boundingRect()
+        self.assertGreater(after.width(), before.width())
+        self.assertEqual(line.points[1].x, 30.0)  # the source is not edited
+        canvas.tool = Canvas.TOOL_EDIT
+        self.assertIs(canvas._find_point(QPointF(36.0, 10.0))[0], filled)
+
+    def test_fill_chains_strokes_into_one_figure(self) -> None:
+        canvas = Canvas(Document(40, 40))
+        top = Stroke([Point(10, 10, 3), Point(30, 10, 3), Point(30, 20, 3)])
+        bottom = Stroke([Point(30, 20, 3), Point(30, 30, 3), Point(10, 30, 3), Point(10, 10, 3)])
+        canvas.doc.layer().strokes.extend([top, bottom])
+        canvas.tool = Canvas.TOOL_FILL
+        canvas.color = (0, 0, 255)
+        canvas._fill_click(QPointF(20, 20))
+        self.assertEqual(len(canvas.doc.layers), 2)
+        layer = canvas.doc.layers[0]
+        self.assertEqual(len(layer.strokes), 1)
+        self.assertEqual(len(canvas.doc.layers[1].strokes), 2)  # originals untouched
+        merged = layer.strokes[0]
+        self.assertTrue(merged.fill is not None)
+        self.assertEqual(merged.closed, True)
+        self.assertFalse(merged.bridge)
+        self.assertGreaterEqual(len(merged.points), 5)
+        self.assertTrue(all(point.width == 0 for point in merged.points))
+        # the merged outline is the same geometry, so it contains the click point
+        self.assertTrue(stroke_path(merged).contains(QPointF(20, 20)))
+
+    def test_fill_preview_highlights_the_figure_under_the_cursor(self) -> None:
+        canvas = Canvas(Document(40, 40))
+        line = Stroke([Point(10, 10, 3), Point(30, 10, 3), Point(30, 30, 3), Point(10, 30, 3)])
+        canvas.doc.layer().strokes.append(line)
+        canvas.tool = Canvas.TOOL_FILL
+        canvas.color = (0, 0, 255)
+        canvas.request_fill_preview(QPointF(20, 20))
+        self.assertIsNotNone(canvas._fill_preview_path)
+        canvas.request_fill_preview(QPointF(2, 2))
+        self.assertIsNone(canvas._fill_preview_path)
+        self.assertFalse(line.closed)
+        self.assertFalse(line.bridge)
+
+    def test_fill_preview_survives_large_canvas(self) -> None:
+        canvas = Canvas(Document(2000, 2000))
+        line = Stroke(
+            [Point(100, 100, 6), Point(900, 100, 6), Point(900, 900, 6), Point(100, 900, 6)]
+        )
+        canvas.doc.layer().strokes.append(line)
+        canvas.tool = Canvas.TOOL_FILL
+        canvas.request_fill_preview(QPointF(500, 500))
+        self.assertIsNotNone(canvas._fill_preview_path)
+
+    def test_document_change_clears_the_preview(self) -> None:
+        canvas = Canvas(Document(40, 40))
+        line = Stroke([Point(10, 10, 3), Point(30, 10, 3), Point(30, 30, 3), Point(10, 30, 3)])
+        canvas.doc.layer().strokes.append(line)
+        canvas.tool = Canvas.TOOL_FILL
+        canvas.request_fill_preview(QPointF(20, 20))
+        self.assertIsNotNone(canvas._fill_preview_path)
+        canvas.documentChanged.emit()
+        self.assertIsNone(canvas._fill_preview_path)
+
+    def test_fill_requires_a_closed_figure(self) -> None:
+        canvas = Canvas(Document(40, 40))
+        line = Stroke([Point(10, 10, 3), Point(30, 10, 3), Point(30, 30, 3)])
+        canvas.doc.layer().strokes.append(line)
+        canvas.tool = Canvas.TOOL_FILL
+        canvas._fill_click(QPointF(5, 35))
+        self.assertIsNone(line.fill)
+        self.assertFalse(line.bridge)
 
 
 class TransformModeTests(unittest.TestCase):
@@ -1116,6 +1480,20 @@ class LayerPanelTests(unittest.TestCase):
     def _window(self) -> MainWindow:
         return MainWindow()
 
+    def test_clip_modes_from_the_panel(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        window._duplicate_layer()
+        document.active_layer = 1
+        window._refresh_layers()
+        window._clip.setCurrentText("outside")
+        self.assertEqual(document.layers[1].clip, "outside")
+        window._refresh_layers()
+        self.assertEqual(window._clip.currentText(), "outside")
+        document.active_layer = 0
+        window._refresh_layers()
+        self.assertFalse(window._clip.isEnabled())
+
     def test_duplicate_layer_copies_content_independently(self) -> None:
         window = self._window()
         document = window.canvas.doc
@@ -1127,31 +1505,179 @@ class LayerPanelTests(unittest.TestCase):
         document.layers[1].strokes[0].points[0].x = 99.0
         self.assertNotEqual(document.layers[0].strokes[0].points[0].x, 99.0)
 
-    def test_duplicate_keeps_shared_mask(self) -> None:
-        window = self._window()
-        document = window.canvas.doc
-        mask_id = document.add_mask("shared", "ZmFrZQ==")
-        document.layer().mask_id = mask_id
-        window._duplicate_layer()
-        self.assertEqual(document.layers[1].mask_id, mask_id)
-
     def test_rename_layer_from_list(self) -> None:
         window = self._window()
-        item = window._layer_list.item(0)
+        item = window._layer_list.topLevelItem(0)
         self.assertIsNotNone(item)
         assert item is not None
-        item.setText("ink")
+        item.setText(0, "ink")
         self.assertEqual(window.canvas.doc.layers[0].name, "ink")
 
-    def test_mask_combo_lists_shared_masks(self) -> None:
+    def _select(self, window: MainWindow, layers: list[Layer]) -> None:
+        window._layer_list.clearSelection()
+        for layer in layers:
+            window._layer_items[id(layer)].setSelected(True)
+
+    def test_group_the_whole_selection_from_panel(self) -> None:
         window = self._window()
         document = window.canvas.doc
-        mask_id = document.add_mask("shared", "ZmFrZQ==")
+        document.layers.append(Layer("second"))
         window._refresh_layers()
-        self.assertGreater(window._mask_combo.findData(mask_id), 0)
-        window._mask_combo.setCurrentIndex(window._mask_combo.findData(mask_id))
-        self.assertEqual(document.layer().mask_id, mask_id)
+        self._select(window, document.layers)
+        window._group_layer()
+        self.assertEqual(len(document.layers), 1)
+        group = document.layers[0]
+        self.assertTrue(group.is_group)
+        self.assertEqual(len(group.children), 2)
+        self.assertIs(document.layer(), group)
 
+    def test_ungroup_several_groups_from_panel(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers = [
+            document.make_group("g1", [Layer("a")]),
+            document.make_group("g2", [Layer("b")]),
+        ]
+        window._refresh_layers()
+        self._select(window, list(document.layers))
+        window._ungroup_layer()
+        self.assertEqual([layer.name for layer in document.layers], ["a", "b"])
 
-if __name__ == "__main__":
-    unittest.main()
+    def _selected_names(self, window: MainWindow) -> list[str]:
+        selected = {id(window._item_layer(item)) for item in window._layer_list.selectedItems()}
+        return [layer.name for layer, _depth in window.canvas.doc.walk() if id(layer) in selected]
+
+    def test_shift_range_starts_from_the_last_plain_click(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers = [Layer("a"), Layer("b"), Layer("c")]
+        window._refresh_layers()
+        tree = window._layer_list
+        a, b, _c = document.layers
+        tree.anchor = b
+        tree.select_range(b, a)
+        self.assertEqual(self._selected_names(window), ["a", "b"])
+        self.assertEqual(document.layer(), a)
+
+    def test_shift_click_extends_from_the_anchor(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers = [Layer("a"), Layer("b"), Layer("c")]
+        window.resize(900, 600)
+        window.show()
+        window._refresh_layers()
+        tree = window._layer_list
+        items = {layer.name: window._layer_items[id(layer)] for layer in document.layers}
+
+        def click(name: str, modifier: Qt.KeyboardModifier) -> None:
+            rect = tree.visualItemRect(items[name])
+            QTest.mouseClick(tree.viewport(), Qt.MouseButton.LeftButton, modifier, rect.center())
+
+        click("b", Qt.KeyboardModifier.NoModifier)
+        self.assertEqual(self._selected_names(window), ["b"])
+        click("c", Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(self._selected_names(window), ["b", "c"])
+        self.assertEqual(document.layer().name, "c")
+        click("a", Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(self._selected_names(window), ["a", "b"])
+        self.assertEqual(document.layer().name, "a")
+
+    def test_shift_range_spans_groups_in_tree_order(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        inner_a, inner_b = Layer("inner a"), Layer("inner b")
+        group = document.make_group("group", [inner_a, inner_b])
+        document.layers = [Layer("a"), group, Layer("c")]
+        window._refresh_layers()
+        tree = window._layer_list
+        tree.anchor = group
+        tree.select_range(group, inner_b)
+        self.assertEqual(self._selected_names(window), ["group", "inner a", "inner b"])
+        self.assertEqual(document.layer(), inner_b)
+
+    def test_selection_does_not_rebuild_the_tree(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers = [Layer("a"), Layer("b")]
+        window._refresh_layers()
+        tree = window._layer_list
+        first, second = tree.topLevelItem(0), tree.topLevelItem(1)
+        assert first is not None and second is not None
+        tree.setCurrentItem(second)
+        self.assertIs(tree.topLevelItem(0), first)
+        self.assertIs(tree.topLevelItem(1), second)
+        self.assertEqual(document.layer().name, "b")
+
+    def test_drop_target_mapping(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers = [Layer("a"), document.make_group("g", [Layer("inner")])]
+        window._refresh_layers()
+        tree = window._layer_list
+        group = document.layers[1]
+        group_item = tree.topLevelItem(1)
+        assert group_item is not None
+        target = tree.drop_target(
+            tree.visualItemRect(group_item).center(),
+            QAbstractItemView.DropIndicatorPosition.OnItem,
+        )
+        self.assertEqual(target, (group.children, len(group.children)))
+
+        a_item = tree.topLevelItem(0)
+        assert a_item is not None
+        point = tree.visualItemRect(a_item).center()
+        self.assertEqual(
+            tree.drop_target(point, QAbstractItemView.DropIndicatorPosition.AboveItem),
+            (document.layers, 0),
+        )
+        self.assertEqual(
+            tree.drop_target(point, QAbstractItemView.DropIndicatorPosition.BelowItem),
+            (document.layers, 1),
+        )
+        self.assertEqual(tree.drop_target(QPoint(-5, -5)), (document.layers, len(document.layers)))
+
+    def test_drop_moves_the_selection_into_a_group(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers = [document.make_group("group", [Layer("inner")]), Layer("outer")]
+        window._refresh_layers()
+        group, outer = document.layers
+        self._select(window, [outer])
+        self.assertTrue(window._drop_layers(group.children, 0))
+        self.assertEqual([layer.name for layer in group.children], ["outer", "inner"])
+        self.assertEqual([layer.name for layer in document.layers], ["group"])
+
+    def test_drop_refuses_a_group_into_itself(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        group = document.make_group("group", [Layer("inner")])
+        document.layers = [group]
+        window._refresh_layers()
+        self._select(window, [group])
+        self.assertFalse(window._drop_layers(group.children, 0))
+        self.assertEqual(len(group.children), 1)
+
+    def test_delete_many_keeps_at_least_one_layer(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers.append(Layer("second"))
+        window._refresh_layers()
+        self._select(window, list(document.layers))
+        window._remove_layer()
+        self.assertEqual(len(document.walk()), 2)
+
+    def test_group_and_ungroup_from_panel(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layer().strokes.append(Stroke([Point(1, 1, 2), Point(5, 5, 2)]))
+        window._group_layer()
+        self.assertTrue(document.layers[0].is_group)
+        self.assertEqual(document.layers[0].children[0].name, "Layer 1")
+        self.assertEqual(document.layer(), document.layers[0])
+        self.assertEqual(window._layer_list.topLevelItemCount(), 1)
+        group_item = window._layer_list.topLevelItem(0)
+        assert group_item is not None
+        self.assertEqual(group_item.childCount(), 1)
+        window._ungroup_layer()
+        self.assertFalse(document.layers[0].is_group)
+        self.assertEqual(document.layers[0].name, "Layer 1")

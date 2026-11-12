@@ -14,8 +14,8 @@ from .model import Document, Layer
 from .render import draw_document
 
 FORMAT = "sai-lineart"
-# Version 2 moved layer masks into the document-wide shared mask store.
-VERSION = 2
+# Version 2 introduced shared masks (removed again), 3 adds layer groups.
+VERSION = 3
 
 
 def ensure_suffix(path: str | Path, suffix: str) -> Path:
@@ -82,42 +82,65 @@ def export_svg(document: Document, path: str | Path) -> None:
         ),
     ]
 
-    for layer in document.layers:
-        if not layer.visible:
-            continue
-        style = ""
-        if layer.opacity < 1.0:
-            style = f' opacity="{layer.opacity:.3f}"'
-        if layer.blend == "multiply":
-            style += ' style="mix-blend-mode:multiply"'
-        parts.append(f'  <g id="{_escape(layer.name)}"{style}>')
-        for stroke in layer.strokes:
-            color = "#{:02x}{:02x}{:02x}".format(*stroke.color)
-            alpha = stroke.alpha / 255
-            samples = sample_stroke(stroke)
-            if len(samples) == 1:
-                x, y, width = samples[0]
-                if width <= 0.01:
-                    continue
-                radius = max(width, 0.5) / 2
-                parts.append(
-                    f'    <circle cx="{x:.2f}" cy="{y:.2f}" r="{radius:.2f}" '
-                    f'fill="{color}" fill-opacity="{alpha:.3f}"/>'
-                )
+    def emit(items: list[Layer], depth: int) -> None:
+        indent = "  " * depth
+        for layer in items:
+            if not layer.visible:
                 continue
-            for (x1, y1, w1), (x2, y2, w2) in itertools.pairwise(samples):
-                width = (w1 + w2) / 2
-                if width <= 0.01:
+            style = ""
+            if layer.opacity < 1.0:
+                style = f' opacity="{layer.opacity:.3f}"'
+            if layer.blend == "multiply":
+                style += ' style="mix-blend-mode:multiply"'
+            parts.append(f'{indent}<g id="{_escape(layer.name)}"{style}>')
+            if layer.is_group:
+                emit(layer.children, depth + 1)
+            for stroke in layer.strokes:
+                color = "#{:02x}{:02x}{:02x}".format(*stroke.color)
+                alpha = stroke.alpha / 255
+                samples = sample_stroke(stroke)
+                if stroke.fill is not None and len(samples) > 2:
+                    loop = [(x, y) for x, y, _width in samples]
+                    parts.append(
+                        f'{indent}  <path d="{_svg_path([loop])}" '
+                        f'fill="#{stroke.fill[0]:02x}{stroke.fill[1]:02x}{stroke.fill[2]:02x}" '
+                        f'fill-opacity="{stroke.fill_alpha / 255:.3f}"/>'
+                    )
+                if len(samples) == 1:
+                    x, y, width = samples[0]
+                    if width <= 0.01:
+                        continue
+                    radius = max(width, 0.5) / 2
+                    parts.append(
+                        f'{indent}  <circle cx="{x:.2f}" cy="{y:.2f}" r="{radius:.2f}" '
+                        f'fill="{color}" fill-opacity="{alpha:.3f}"/>'
+                    )
                     continue
-                parts.append(
-                    f'    <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" '
-                    f'stroke="{color}" stroke-opacity="{alpha:.3f}" '
-                    f'stroke-width="{width:.2f}" stroke-linecap="round"/>'
-                )
-        parts.append("  </g>")
+                for (x1, y1, w1), (x2, y2, w2) in itertools.pairwise(samples):
+                    width = (w1 + w2) / 2
+                    if width <= 0.01:
+                        continue
+                    parts.append(
+                        f'{indent}  <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" '
+                        f'stroke="{color}" stroke-opacity="{alpha:.3f}" '
+                        f'stroke-width="{width:.2f}" stroke-linecap="round"/>'
+                    )
+            parts.append(f"{indent}</g>")
+
+    emit(document.layers, 1)
 
     parts.append("</svg>")
     Path(path).write_text("\n".join(parts) + "\n", encoding="utf-8")
+
+
+def _svg_path(loops: list[list[tuple[float, float]]]) -> str:
+    parts: list[str] = []
+    for loop in loops:
+        if len(loop) < 3:
+            continue
+        points = " L ".join(f"{x:.2f} {y:.2f}" for x, y in loop)
+        parts.append(f"M {points} Z")
+    return " ".join(parts)
 
 
 def encode_image(image: QImage) -> str:

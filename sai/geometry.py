@@ -302,6 +302,11 @@ def sample_stroke(
             points, circle_tangents, index, min_step, max_steps, dense, closed
         ):
             samples.append((x, y, width))
+    if stroke.bridge and not closed and len(points) >= 3:
+        # Straight bridge between the open ends: one extra sample draws the line
+        # from the last sample back to the first point, with interpolated width.
+        first = points[0]
+        samples.append((first.x, first.y, first.width))
     return samples
 
 

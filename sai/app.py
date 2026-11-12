@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox,
+    QAbstractItemView,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -16,8 +17,6 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -26,6 +25,8 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QToolBar,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -33,6 +34,118 @@ from PySide6.QtWidgets import (
 from . import io
 from .canvas import Canvas
 from .model import Document, Layer
+
+
+class LayerTree(QTreeWidget):
+    """Layer tree; drops are delegated to the window, the model stays the source of truth."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setHeaderHidden(True)
+        self.setRootIsDecorated(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.document: Document | None = None
+        self.on_drop: Callable[[list[Layer], int], bool] | None = None
+        # Shift-range anchor: the layer of the last plain/Ctrl click.
+        self.anchor: Layer | None = None
+
+    def item_layer(self, item: QTreeWidgetItem | None) -> Layer | None:
+        if item is None:
+            return None
+        layer = item.data(0, Qt.ItemDataRole.UserRole)
+        return layer if isinstance(layer, Layer) else None
+
+    def ordered_items(self) -> list[QTreeWidgetItem]:
+        """Items in draw order (same walk as Document.walk)."""
+        items: list[QTreeWidgetItem] = []
+
+        def visit(parent: QTreeWidgetItem) -> None:
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                if child is None:
+                    continue
+                items.append(child)
+                visit(child)
+
+        for index in range(self.topLevelItemCount()):
+            item = self.topLevelItem(index)
+            if item is None:
+                continue
+            items.append(item)
+            visit(item)
+        return items
+
+    def select_range(self, start: Layer, end: Layer) -> None:
+        """Select every item between two layers in tree order, end becomes current."""
+        items = self.ordered_items()
+        layers = [self.item_layer(item) for item in items]
+        try:
+            first = next(index for index, layer in enumerate(layers) if layer is start)
+            last = next(index for index, layer in enumerate(layers) if layer is end)
+        except StopIteration:
+            return
+        end_item = next(item for item, layer in zip(items, layers) if layer is end)
+        if first > last:
+            first, last = last, first
+        # Current first: it drives the active layer (and must be the clicked end).
+        self.setCurrentItem(end_item)
+        self.clearSelection()
+        for item in items[first : last + 1]:
+            item.setSelected(True)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            layer = self.item_layer(self.itemAt(event.position().toPoint()))
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier and layer is not None:
+                self.select_range(self.anchor or layer, layer)
+                event.accept()
+                return
+            if layer is not None:
+                self.anchor = layer
+        super().mousePressEvent(event)
+
+    def drop_target(
+        self,
+        position: QPoint,
+        indicator: QAbstractItemView.DropIndicatorPosition | None = None,
+    ) -> tuple[list[Layer], int] | None:
+        """Sibling list and position a drop at ``position`` means."""
+        document = self.document
+        if document is None:
+            return None
+        item = self.itemAt(position)
+        if indicator is None:
+            indicator = self.dropIndicatorPosition()
+        if item is None:
+            return document.layers, len(document.layers)
+        layer = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(layer, Layer):
+            return None
+        if layer.is_group and indicator == QAbstractItemView.DropIndicatorPosition.OnItem:
+            return layer.children, len(layer.children)
+        located = document.locate(layer)
+        if located is None:
+            return None
+        siblings, index = located
+        if indicator == QAbstractItemView.DropIndicatorPosition.AboveItem:
+            return siblings, index
+        return siblings, index + 1
+
+    def dropEvent(self, event) -> None:
+        target = self.drop_target(event.position().toPoint())
+        handler = self.on_drop
+        if target is None or handler is None:
+            event.ignore()
+            return
+        if handler(*target):
+            event.accept()
+        else:
+            event.ignore()
 
 
 class CanvasSizeDialog(QDialog):
@@ -222,6 +335,14 @@ class MainWindow(QMainWindow):
         self._alpha_slider.valueChanged.connect(self._set_alpha)
         bar.addWidget(self._alpha_slider)
 
+        bar.addSeparator()
+        self._scope_action = QAction("Scope: layer", self)
+        self._scope_action.setCheckable(True)
+        self._scope_action.setToolTip("Edit and fill: active layer or the whole image")
+        self._scope_action.setShortcut(QKeySequence("Shift+S"))
+        self._scope_action.toggled.connect(self._on_scope_toggled)
+        bar.addAction(self._scope_action)
+
     def _build_layers_dock(self) -> None:
         dock = QDockWidget("Layers", self)
         dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable)
@@ -229,8 +350,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(6, 6, 6, 6)
 
-        self._layer_list = QListWidget(panel)
-        self._layer_list.currentRowChanged.connect(self._on_layer_selected)
+        self._layer_list = LayerTree(panel)
+        self._layer_list.on_drop = self._drop_layers
+        self._layer_list.currentItemChanged.connect(self._on_layer_selected)
         self._layer_list.itemChanged.connect(self._on_layer_item_changed)
         self._layer_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._layer_list.customContextMenuRequested.connect(self._layer_context_menu)
@@ -241,11 +363,13 @@ class MainWindow(QMainWindow):
             ("+", self._add_layer),
             ("-", self._remove_layer),
             ("dup", self._duplicate_layer),
+            ("grp", self._group_layer),
+            ("ung", self._ungroup_layer),
             ("^", lambda: self._move_layer(-1)),
             ("v", lambda: self._move_layer(1)),
         ):
             button = QPushButton(label, panel)
-            button.setFixedWidth(36 if label == "dup" else 28)
+            button.setFixedWidth(36 if label in ("dup", "grp", "ung") else 28)
             button.clicked.connect(slot)
             buttons.addWidget(button)
         buttons.addStretch(1)
@@ -268,25 +392,13 @@ class MainWindow(QMainWindow):
         blend_row.addWidget(self._blend, 1)
         layout.addLayout(blend_row)
 
-        self._clip = QCheckBox("Clip to below", panel)
-        self._clip.toggled.connect(self._on_clip_toggled)
-        layout.addWidget(self._clip)
-
-        mask_row = QHBoxLayout()
-        mask_row.addWidget(QLabel("Mask", panel))
-        self._mask_combo = QComboBox(panel)
-        self._mask_combo.currentIndexChanged.connect(self._on_mask_selected)
-        mask_row.addWidget(self._mask_combo, 1)
-        layout.addLayout(mask_row)
-
-        mask_buttons = QHBoxLayout()
-        self._mask_button = QPushButton("Load mask...", panel)
-        self._mask_button.clicked.connect(self._set_mask)
-        self._clear_mask_button = QPushButton("Clear mask", panel)
-        self._clear_mask_button.clicked.connect(self._clear_mask)
-        mask_buttons.addWidget(self._mask_button)
-        mask_buttons.addWidget(self._clear_mask_button)
-        layout.addLayout(mask_buttons)
+        clip_row = QHBoxLayout()
+        clip_row.addWidget(QLabel("Clip to below", panel))
+        self._clip = QComboBox(panel)
+        self._clip.addItems(["off", "inside", "outside"])
+        self._clip.currentTextChanged.connect(self._on_clip_changed)
+        clip_row.addWidget(self._clip, 1)
+        layout.addLayout(clip_row)
 
         self._raster_icon = QIcon(self._make_raster_swatch())
 
@@ -328,6 +440,8 @@ class MainWindow(QMainWindow):
         self._add_action(
             edit_menu, "Deselect All", self._deselect_all, QKeySequence("Ctrl+Shift+A")
         )
+        edit_menu.addSeparator()
+        self._add_action(edit_menu, "Convert Vector to Fill", self._convert_to_fill)
 
         view_menu = self.menuBar().addMenu("&View")
         self._add_action(
@@ -357,9 +471,12 @@ class MainWindow(QMainWindow):
                 "Rename Layer...", self._rename_layer, QKeySequence("F2")
             ),
             "delete": self._window_action("Delete Layer", self._remove_layer),
+            "group": self._window_action("Group Layer", self._group_layer, QKeySequence("Ctrl+G")),
+            "ungroup": self._window_action(
+                "Ungroup", self._ungroup_layer, QKeySequence("Ctrl+Shift+G")
+            ),
             "up": self._window_action("Move Up", lambda: self._move_layer(-1)),
             "down": self._window_action("Move Down", lambda: self._move_layer(1)),
-            "clean_masks": self._window_action("Remove Unused Masks", self._remove_unused_masks),
         }
 
     def _window_action(
@@ -379,18 +496,20 @@ class MainWindow(QMainWindow):
         item = self._layer_list.itemAt(position)
         menu = QMenu(self._layer_list)
         if item is not None:
-            row = self._layer_list.row(item)
-            if 0 <= row < len(self.canvas.doc.layers):
-                self._layer_list.setCurrentRow(row)
+            if not item.isSelected():
+                self._layer_list.clearSelection()
+                item.setSelected(True)
+            self._layer_list.setCurrentItem(item)
             menu.addAction(self._layer_actions["duplicate"])
             menu.addAction(self._layer_actions["rename"])
             menu.addAction(self._layer_actions["delete"])
             menu.addSeparator()
+            menu.addAction(self._layer_actions["group"])
+            menu.addAction(self._layer_actions["ungroup"])
             menu.addAction(self._layer_actions["up"])
             menu.addAction(self._layer_actions["down"])
             menu.addSeparator()
         menu.addAction(self._layer_actions["new"])
-        menu.addAction(self._layer_actions["clean_masks"])
         menu.exec(self._layer_list.viewport().mapToGlobal(position))
 
     def _add_action(
@@ -448,69 +567,120 @@ class MainWindow(QMainWindow):
     def _on_document_changed(self) -> None:
         self._refresh_layers()
 
-    def _refresh_layers(self) -> None:
+    @staticmethod
+    def _item_layer(item: QTreeWidgetItem | None) -> Layer | None:
+        if item is None:
+            return None
+        layer = item.data(0, Qt.ItemDataRole.UserRole)
+        return layer if isinstance(layer, Layer) else None
+
+    def _selected_layers(self) -> list[Layer]:
+        layers = [
+            layer
+            for layer in (self._item_layer(item) for item in self._layer_list.selectedItems())
+            if layer is not None
+        ]
+        return self.canvas.doc.sort_layers(layers)
+
+    def _refresh_layers(self, selection: list[Layer] | None = None) -> None:
         document = self.canvas.doc
+        tree = self._layer_list
+        tree.document = document
+        if selection is None:
+            selection = self._selected_layers()
         self._refreshing = True
-        self._layer_list.clear()
-        for index, layer in enumerate(document.layers):
-            item = QListWidgetItem(layer.name)
-            item.setFlags(
-                item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEditable
-            )
-            item.setCheckState(Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
-            if layer.kind == "raster":
-                item.setIcon(self._raster_icon)
-                item.setToolTip("raster image layer")
-            self._layer_list.addItem(item)
-            if index == document.active_layer:
-                self._layer_list.setCurrentRow(index)
-        layer = document.layer()
-        self._opacity.setValue(round(layer.opacity * 100))
-        self._blend.setCurrentText(layer.blend)
-        self._clip.setChecked(layer.clip_to_below)
-        self._clip.setEnabled(document.active_layer > 0)
-        self._refresh_masks(layer)
-        self._clear_mask_button.setEnabled(layer.mask_id is not None)
+        tree.clear()
+        self._layer_items: dict[int, QTreeWidgetItem] = {}
+
+        def add(items: list[Layer], parent: QTreeWidgetItem | None) -> None:
+            for layer in items:
+                item = QTreeWidgetItem([layer.name])
+                item.setFlags(
+                    item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEditable
+                )
+                item.setCheckState(
+                    0, Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked
+                )
+                item.setData(0, Qt.ItemDataRole.UserRole, layer)
+                if layer.kind == "raster":
+                    item.setIcon(0, self._raster_icon)
+                    item.setToolTip(0, "raster image layer")
+                elif layer.is_group:
+                    item.setToolTip(0, "group")
+                if parent is None:
+                    self._layer_list.addTopLevelItem(item)
+                else:
+                    parent.addChild(item)
+                self._layer_items[id(layer)] = item
+                if layer.is_group:
+                    add(layer.children, item)
+                    item.setExpanded(True)
+
+        add(document.layers, None)
+        tree.expandAll()
+
+        for layer in selection:
+            item = self._layer_items.get(id(layer))
+            if item is not None:
+                item.setSelected(True)
+        active = document.layer()
+        item = self._layer_items.get(id(active))
+        if item is not None:
+            tree.setCurrentItem(item)
+        if tree.anchor is None or id(tree.anchor) not in self._layer_items:
+            tree.anchor = active
+        self._refresh_layer_properties()
         self._refreshing = False
         self.canvas.update()
 
-    def _refresh_masks(self, layer: Layer) -> None:
-        self._mask_combo.clear()
-        self._mask_combo.addItem("(none)", None)
-        for mask_id, mask in self.canvas.doc.masks.items():
-            shared = sum(1 for item in self.canvas.doc.layers if item.mask_id == mask_id)
-            self._mask_combo.addItem(f"{mask.name} ({shared})", mask_id)
-        index = self._mask_combo.findData(layer.mask_id)
-        self._mask_combo.setCurrentIndex(max(0, index))
+    def _refresh_layer_properties(self) -> None:
+        """Opacity/blend/clip rows for the active layer, without rebuilding the tree."""
+        document = self.canvas.doc
+        active = document.layer()
+        was_refreshing = self._refreshing
+        self._refreshing = True
+        self._opacity.setValue(round(active.opacity * 100))
+        self._blend.setCurrentText(active.blend)
+        self._clip.setCurrentText(active.clip)
+        located = document.locate(active)
+        self._clip.setEnabled(located is not None and located[1] > 0)
+        self._refreshing = was_refreshing
 
     def _make_raster_swatch(self) -> QPixmap:
         pixmap = QPixmap(10, 10)
         pixmap.fill(QColor(120, 150, 190))
         return pixmap
 
-    def _on_layer_selected(self, row: int) -> None:
-        if self._refreshing or row < 0:
+    def _on_layer_selected(
+        self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None = None
+    ) -> None:
+        if self._refreshing or current is None:
+            return
+        layer = current.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(layer, Layer):
+            return
+        index = self.canvas.doc.walk_index(layer)
+        if index < 0:
             return
         if self.canvas.transform_mode:
             self.canvas.commit_transform()
-        self.canvas.doc.active_layer = row
+        self.canvas.doc.active_layer = index
         self.canvas.clear_hover()
         self.canvas.clear_selection()
-        self._refresh_layers()
+        self._refresh_layer_properties()
 
-    def _on_layer_item_changed(self, item: QListWidgetItem) -> None:
+    def _on_layer_item_changed(self, item: QTreeWidgetItem, _column: int) -> None:
         if self._refreshing:
             return
-        row = self._layer_list.row(item)
-        if not 0 <= row < len(self.canvas.doc.layers):
+        layer = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(layer, Layer):
             return
-        layer = self.canvas.doc.layers[row]
-        visible = item.checkState() == Qt.CheckState.Checked
+        visible = item.checkState(0) == Qt.CheckState.Checked
         if visible != layer.visible:
             layer.visible = visible
             self.canvas.clear_hover()
             self.canvas.update()
-        name = item.text().strip()
+        name = item.text(0).strip()
         if name and name != layer.name:
             self.canvas.push_undo()
             layer.name = name
@@ -528,82 +698,79 @@ class MainWindow(QMainWindow):
         self.canvas.doc.layer().blend = value
         self.canvas.update()
 
-    def _on_clip_toggled(self, checked: bool) -> None:
+    def _on_clip_changed(self, value: str) -> None:
         if self._refreshing:
             return
-        self.canvas.doc.layer().clip_to_below = checked
+        self.canvas.doc.layer().clip = value
         self.canvas.update()
-
-    def _set_mask(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Layer mask",
-            "",
-            "Images (*.png *.jpg *.jpeg *.webp *.bmp)",
-        )
-        if not path:
-            return
-        try:
-            source = io.load_raster_layer(path, "mask")
-        except OSError as error:
-            QMessageBox.critical(self, "Mask failed", str(error))
-            return
-        document = self.canvas.doc
-        self.canvas.push_undo()
-        mask_id = document.add_mask(Path(path).stem, source.image_base64 or "")
-        document.layer().mask_id = mask_id
-        self._refresh_layers()
-
-    def _on_mask_selected(self, index: int) -> None:
-        if self._refreshing or index < 0:
-            return
-        document = self.canvas.doc
-        layer = document.layer()
-        mask_id = self._mask_combo.itemData(index)
-        selected = mask_id if isinstance(mask_id, str) else None
-        if selected == layer.mask_id:
-            return
-        self.canvas.push_undo()
-        layer.mask_id = selected
-        self._refresh_layers()
-
-    def _clear_mask(self) -> None:
-        layer = self.canvas.doc.layer()
-        if not layer.mask_id:
-            return
-        self.canvas.push_undo()
-        layer.mask_id = None
-        self._refresh_layers()
-
-    def _remove_unused_masks(self) -> None:
-        document = self.canvas.doc
-        used = {layer.mask_id for layer in document.layers if layer.mask_id}
-        if not any(mask_id not in used for mask_id in document.masks):
-            self.statusBar().showMessage("no unused masks")
-            return
-        self.canvas.push_undo()
-        removed = document.remove_unused_masks()
-        self._refresh_layers()
-        self.statusBar().showMessage(f"removed {removed} unused mask(s)")
 
     def _add_layer(self) -> None:
         document = self.canvas.doc
         self.canvas.push_undo()
-        index = document.active_layer + 1
-        document.layers.insert(index, Layer(f"Layer {len(document.layers) + 1}"))
-        document.active_layer = index
+        layer = Layer(f"Layer {len(document.walk()) + 1}")
+        document.active_layer = document.insert_above(document.layer(), layer)
         self._refresh_layers()
 
     def _duplicate_layer(self) -> None:
         document = self.canvas.doc
+        layers = self._selected_layers()
+        if not layers:
+            return
         self.canvas.push_undo()
-        source = document.layer()
-        duplicate = source.copy()
-        duplicate.name = f"{source.name} copy"
-        index = document.active_layer + 1
-        document.layers.insert(index, duplicate)
-        document.active_layer = index
-        self._refresh_layers()
+        copies: list[Layer] = []
+        for layer in layers:
+            duplicate = layer.duplicate()
+            duplicate.name = f"{layer.name} copy"
+            document.insert_above(layer, duplicate)
+            copies.append(duplicate)
+        document.active_layer = document.walk_index(copies[0])
+        self._refresh_layers(copies)
+
+    def _group_layer(self) -> None:
+        document = self.canvas.doc
+        layers = self._selected_layers()
+        if not layers:
+            self.statusBar().showMessage("select layers to group")
+            return
+        self.canvas.push_undo()
+        group = document.group_layers(layers)
+        if group is not None:
+            document.active_layer = document.walk_index(group)
+        self._refresh_layers([group] if group is not None else [])
+
+    def _ungroup_layer(self) -> None:
+        document = self.canvas.doc
+        groups = [layer for layer in self._selected_layers() if layer.is_group]
+        if not groups:
+            self.statusBar().showMessage("select a group to ungroup")
+            return
+        self.canvas.push_undo()
+        released: list[Layer] = []
+        for group in groups:
+            members = list(group.children)
+            document.ungroup(group)
+            released.extend(members)
+        if released:
+            document.active_layer = document.walk_index(released[0])
+        self._refresh_layers(released)
+
+    def _drop_layers(self, siblings: list[Layer], index: int) -> bool:
+        """Drag&drop from the tree: move the selection into ``siblings`` at ``index``."""
+        document = self.canvas.doc
+        layers = self._selected_layers()
+        if not layers:
+            return False
+        active = document.layer()
+        snapshot = document.copy()
+        moved = document.move_layers(layers, siblings, index)
+        if not moved:
+            return False
+        self.canvas.push_undo_snapshot(snapshot)
+        document.active_layer = document.walk_index(active)
+        self.canvas.clear_hover()
+        self._refresh_layers(moved)
+        self.statusBar().showMessage(f"moved {len(moved)} layer(s)")
+        return True
 
     def _rename_layer(self) -> None:
         item = self._layer_list.currentItem()
@@ -612,26 +779,31 @@ class MainWindow(QMainWindow):
 
     def _remove_layer(self) -> None:
         document = self.canvas.doc
-        if len(document.layers) <= 1:
+        layers = self._selected_layers()
+        if not layers:
+            return
+        removable = sum(document.node_count(layer) for layer in layers)
+        if len(document.walk()) - removable <= 0:
+            self.statusBar().showMessage("a document needs at least one layer")
             return
         self.canvas.push_undo()
-        del document.layers[document.active_layer]
-        document.active_layer = min(document.active_layer, len(document.layers) - 1)
-        self._refresh_layers()
+        for layer in layers:
+            document.remove_layer(layer)
+        document.active_layer = min(document.active_layer, len(document.walk()) - 1)
+        self._refresh_layers([])
 
     def _move_layer(self, direction: int) -> None:
         document = self.canvas.doc
-        index = document.active_layer
-        target = index + direction
-        if not 0 <= target < len(document.layers):
+        layers = self._selected_layers()
+        if not layers:
             return
-        self.canvas.push_undo()
-        document.layers[index], document.layers[target] = (
-            document.layers[target],
-            document.layers[index],
-        )
-        document.active_layer = target
-        self._refresh_layers()
+        active = document.layer()
+        snapshot = document.copy()
+        if not document.move_selection(layers, direction):
+            return
+        self.canvas.push_undo_snapshot(snapshot)
+        document.active_layer = document.walk_index(active)
+        self._refresh_layers(layers)
 
     def _rotate_view(self, degrees: float) -> None:
         angle = self.canvas.rotate_view(degrees)
@@ -731,9 +903,7 @@ class MainWindow(QMainWindow):
             return
         document = self.canvas.doc
         self.canvas.push_undo()
-        index = document.active_layer + 1
-        document.layers.insert(index, layer)
-        document.active_layer = index
+        document.active_layer = document.insert_above(document.layer(), layer)
         self.canvas.documentChanged.emit()
         self.canvas.update()
 
@@ -763,6 +933,15 @@ class MainWindow(QMainWindow):
     def _deselect_all(self) -> None:
         self.canvas.setFocus()
         self.canvas.clear_selection()
+
+    def _on_scope_toggled(self, checked: bool) -> None:
+        self.canvas.set_scope("image" if checked else "layer")
+        self._scope_action.setText("Scope: image" if checked else "Scope: layer")
+
+    def _convert_to_fill(self) -> None:
+        self.canvas.setFocus()
+        if self.canvas.convert_to_fill():
+            self._refresh_layers()
 
     def _transform_layer(self) -> None:
         self.canvas.begin_transform()

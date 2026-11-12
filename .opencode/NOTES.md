@@ -9,7 +9,7 @@
 
 ## Architecture
 
-- `sai/model.py` — `Point(x, y, width, smooth)`, `Stroke`, `Layer`, `Mask`, `Document`. JSON is the
+- `sai/model.py` — `Point(x, y, width, smooth)`, `Stroke`, `Layer` (plain, raster or group),
   master format: `{"format": "sai-lineart", "version": 2, ...}` (version 1 loads and migrates).
   `Stroke.closed` means last→first is drawn too; the key is written only when true, so old
   files stay untouched and open.
@@ -65,81 +65,82 @@
 - `QImage.save(QBuffer, "PNG")` fails PySide6 6.12 stubs/runtime typing; encode via a temp file instead.
 - Embedded base64 grows the JSON master file; move to external assets if documents get heavy.
 
-## Clipping / masks
-- `Layer.clip_to_below` + shared masks: `Document.masks: dict[str, Mask]` (alpha PNG) and
-  `Layer.mask_id`. One `Mask` can serve any number of layers; `Mask._cached_image` holds the
-  decoded QImage. Version-1 files keep the payload in `Layer` JSON key `"mask"`; `Document.from_dict`
-  migrates it into `masks` as `mask-N`.
-- Rendering groups a base layer with following clipped layers: each is rendered to an offscreen
-  QImage, masked with `CompositionMode_DestinationIn` (own mask, then base alpha), then composited.
-- Plain layers still draw directly; offscreen buffers are only allocated when a mask/clip exists.
+## Layers, groups and clipping
+- `Layer` is a node: `kind == "group"` uses `children` (list of `Layer`), ordinary layers use
+  `strokes`/`image_base64`. `Document.walk()` yields `(layer, depth)` in draw order and
+  **`active_layer` is an index into `walk()`** (groups included), so the UI/undo stay
+  index-based. Tree helpers: `locate()`, `insert_below()`/`insert_above()`, `remove_layer()`,
+  `swap_with_sibling()`, `all_layers()` (no groups).
+- Multi-layer edits use set operations instead of index math: `sort_layers()` (walk order,
+  dedupe), `move_layers(layers, target_children, index)` (order kept, indices adjusted for
+  removals in the same list, cycles refused via `group_owning()`/`is_ancestor()`),
+  `group_layers()` (inserts the group at the topmost selected position, then moves the
+  selection inside), `move_selection()` (block-safe direction: reversed when moving up),
+  `node_count()` for the "keep at least one layer" guard.
+- Selection: `_on_layer_selected()` must NOT rebuild the tree — `tree.clear()` drops Qt's
+  shift anchor (bug: ranges always started at the topmost item). It only updates the active
+  layer and the opacity/blend/clip rows via `_refresh_layer_properties()`. Shift-range is
+  ours: `LayerTree.anchor` = layer of the last plain/Ctrl click, `select_range()` selects the
+  DFS slice between anchor and clicked item, current item = clicked end (drives
+  `active_layer`). Items are created in `Document.walk()` order, so the slice matches draw
+  order.
+- The layer panel is a `LayerTree(QTreeWidget)` with `ExtendedSelection` and `InternalMove`.
+  `dropEvent` does **not** move items: it asks `drop_target()` for `(siblings, index)` and
+  calls `MainWindow._drop_layers()`, then the tree is rebuilt from the model (single source of
+  truth). Drop on a group item = append into it, `AboveItem`/`BelowItem` = insert at that
+  sibling position, empty viewport = top level. Selection is preserved by layer identity
+  across refreshes and is dropped after undo/redo (new document objects).
+- Actions that may be no-ops (`_move_layer`, `_drop_layers`) take a `Document.copy()`
+  snapshot first and call `Canvas.push_undo_snapshot()` only when something changed.
+- Rendering is recursive (`render._draw_stack`): a group draws its children into the current
+  painter, and `_apply_composition()` **multiplies** `painter.opacity()` by the node's
+  opacity — otherwise a group opacity would be overwritten by its children's 1.0.
+- `clip` refers to the **previous sibling in the same list**, not the global layer below:
+  `inside` = `DestinationIn` with the base render, `outside` = `DestinationOut`. A group can
+  be the base for a clipped layer and can itself be clipped.
+- Masks were removed (v3): no `Document.masks`, `MaskTerm`, `Layer.mask_id`. A stencil is now
+  a PNG layer (File > Import PNG as Layer) used with `clip`, or a group. Legacy `"masks"`/
+  `"mask_id"` keys in old JSON are ignored; `"clip": true` still loads as `"inside"`.
+- SVG export recurses groups into nested `<g>` (opacity/blend on the group tag); clip is not
+  expressed in SVG, as before.
 
-## Recolor tool
-- `Canvas.TOOL_RECOLOR` (`6`): `_stroke_at()` picks the closest stroke **of the active visible
-  vector layer** (`active_vector_layer()`); the hit limit is `max(hit_radius, width/2)` with the
-  width interpolated at the nearest curve parameter, so thick lines are hit near their edge.
-- The gesture (`_recolor_gesture`) pushes one undo snapshot per drag via `_recolor_dirty`,
-  set false on press/release; a miss or a stroke that already has the colour writes no undo.
-- `_hovered_stroke` is drawn by `_draw_stroke_hover` in Edit/Width/Erase (hover outline) and by
-  `_draw_recolor_overlay` (outline + colour preview). `clear_hover()` is called when the active
-  layer changes or its visibility flips.
-- `_draw_point_handles()` is shared: point marks are drawn in Edit/Width/Erase and in Recolor
-  (user request: same anchors everywhere), for `active_vector_layer()` only.
-
-## Point selection and joining (Edit tool)
-- `Canvas._selected: list[(Stroke, index)]` holds references, not ids. undo/redo/`set_document`
-  and layer switches clear it: those replace the document object, so stale refs would drag dead
-  points. `selected_points()` prunes invalid entries on every use.
-- `_edit_press(scene, shift)` is the single entry point for Edit clicks: a plain click never
-  changes the selection — it drags the clicked point, or the whole selection when that point is
-  part of it (user request, 2026-11-11: plain selection broke the flow). Shift-click toggles a
-  point, a click on the curve inserts a point (old behaviour), anything else starts a rubber
-  band (`_box_start`).
-- `merge_selected()` (M): inside one stroke, two endpoints close it (`closed = True`, no points
-  removed); other points merge into the centre of mass at the lowest index. Two strokes join only
-  at their ends and keep the colour of the stroke that sits lower in the layer.
-- `delete_selected()` splits strokes at the removed indices and always emits a single undo entry;
-  removing points from a closed stroke reopens it.
-- Group wheel width reuses `_width_edit_key` with the literal `"selection"` key, so a wheel burst
-  is one undo entry for the whole selection.
-- Right click in Edit opens the canvas context menu only when something is selected; otherwise it
-  keeps deleting the point under the cursor.
-- Single-point strokes ("dots") need their own hit test: `nearest_curve_point()` returns index -1
-  for `len(points) < 2`, so `_stroke_at()` measures the distance to the point itself with limit
-  `max(hit_radius, width/2)`. The same blind spot exists in any curve-based picker.
-
-## Layer scoping of editing tools
-- Edit (points, insertion, deletion, wheel width), Width, Erase and Recolor only touch
-  `Canvas.active_vector_layer()` — the active layer if it is visible and vector. Point handles in
-  the overlay are drawn for that layer only. Don't switch these loops back to `doc.layers`
-  without a reason: it makes editing ambiguous (user request, 2026-11-11).
-
-## View rotation
-- `Canvas.rotation` is a view-only angle (degrees, clockwise). Mapping is
-  `screen = pan + zoom * R(rotation) * scene`; `to_scene` inverts it, `scene_to_screen` forwards it.
-- `paintEvent` does `translate(pan) -> rotate(rotation) -> scale(zoom)`; `_zoom_at` re-derives `pan`
-  through `scene_to_screen`, so the point under the cursor stays put while rotated.
-- `set_rotation` keeps the widget centre anchored (the canvas does not fly off screen).
-- The document and exports never see `rotation`; `set_document` resets it to 0.
-- `mouseReleaseEvent` must reset `_panning` before the `transform_mode` early return; otherwise a
-  middle-click pan inside transform mode never ends and the view keeps following the cursor.
-  Any new early return in the release path has the same trap.
-
-
-## Transform mode
-- `Canvas.begin_transform()` snapshots the active layer + doc, shows an overlay box from
-  `transform.content_bounds()`; edits are applied live from the snapshot via
-  `transform.apply_transform()` (rotate/scale/translate around a pivot).
-- Edge drag = axis scale, inside = move, outside = rotate; Enter commits (one undo), Esc restores.
-- Raster layers are re-encoded from the snapshot on every live update, so no cumulative resampling.
-
-## Bucket fill
-- `sai/fill.py`: renders the document without the target layer to get walls from alpha,
-  scanline flood fill (numpy), dilates the mask by 1 px so the fill tucks under antialiased lines.
-- Target must be a raster layer; the Fill tool creates one below the vector layer if needed.
-- `_alpha_array()` MUST `.copy()` the numpy view of `QImage.constBits()` — a view outlives the
-  temporary `Format_Alpha8` QImage and segfaults on large canvases.
-- 2000x2000 fill takes ~1.1 s.
-- Fill walls: vector layers plus raster layers ABOVE the target; raster layers below are
-  background only, so an open region is bounded by the canvas. This matters when an opaque
-  underlay or a previous fill sits below the fill layer.
+## Vector fills and scope switch
+- `Stroke.uid` / `Layer.uid` (uuid hex) are stable references; they survive copy and are
+  written to JSON (`from_dict` regenerates when absent).
+- `Stroke.fill` + `fill_alpha` = a filled closed path (render draws `stroke_path()` first).
+- A vector fill **duplicates the owner layer** (`Layer.duplicate()` — fresh uid for the
+  layer and every stroke, so stroke references never collide) and inserts the copy
+  below it as `Fill N`. In the copy, `Canvas._fill_vector_at()` sets `bridge=True` + `fill` +
+  `fill_alpha` on the figure stroke, or replaces a multi-stroke figure with one merged
+  stroke. The source layer is never touched (user decision 2026-11-11: "duplicate the layer,
+  then fill it").
+- `Stroke.bridge` closes last -> first with a **straight** segment: `sample_stroke()` appends
+  one sample of the first point, so the drawn line and the fill path close identically.
+  Never use `Stroke.closed` for that: it samples the closing segment from the neighbour
+  tangents, so the link curves away from the silhouette (bug: 5-point bean, +62 px lobe).
+- `render.stroke_path()` always closes (>=3 samples), because it only serves fills; the
+  fill boundary is the centreline, so the stroke itself covers it.
+- Multi-stroke figures: `fill.figure_at()` seeds with the stroke whose **bounding box** is
+  nearest (not `nearest_curve_point` — that cost 60 ms per move with 400 strokes) and chains
+  strokes whose ends are within `JOIN_TOLERANCE = 10 px` (both directions, reversing as
+  needed). If the chain is longer than the seed, the duplicate gets one merged `width=0`
+  stroke (same points, joint duplicates dropped) at the position of the first figure stroke,
+  with `closed=True` when the chain returns to its start, else `bridge=True`. Nested/adjacent
+  figures are still decided by `QPainterPath.contains()`.
+- Preview is geometry-only (`Canvas.request_fill_preview()` -> `_fill_preview_path`): the
+  tint is `fillPath` of the same closed path, 0.8 ms per move with 400 strokes at 2000²,
+  no timers or rasters.
+- Raster layers keep the old `fill.region_mask()` + `bucket_fill()` path (walls above,
+  rasters below are background); vector fills no longer touch it.
+- `convert_to_fill()` copies the active layer, closes its strokes, zeroes width and sets
+  `fill` (static conversion of an existing line art layer).
+- `Canvas.scope` = `"layer"` (default) | `"image"`; `editable_layers()` feeds every picker
+  (`_find_point`, `_insert_point`, `_erase_at`, `_stroke_at`, handles, box selection), so the
+  switch is global. Fill walls use the same scope (`fill._is_wall`).
+- `Layer.clip` is a string: `"off" | "inside" | "outside"`, referring to the **previous
+  sibling in the same list**. `_draw_stack()` collects the run of siblings after the base with
+  `clip != "off"`, renders each to its own buffer and masks it with the base image:
+  `DestinationIn` for `"inside"`, `DestinationOut` for `"outside"`. Legacy `"clip": true` in
+  JSON loads as `"inside"` (`model._clip_mode`). The clipped layer is composited after the
+  base, so a pixel inside the base still shows the base colour — check colours, not just
+  alpha, in tests.

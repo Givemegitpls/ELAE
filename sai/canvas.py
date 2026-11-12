@@ -4,14 +4,17 @@ import itertools
 import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QMenu, QWidget
 
 from . import fill
 from .geometry import nearest_curve_point, nearest_point, sample_stroke
 from .model import Document, Layer, Point, Stroke
-from .render import draw_document, draw_stroke
+from .render import draw_document, draw_stroke, stroke_path
 from .transform import apply_transform, content_bounds, map_point
+
+# Fill tool preview: the figure under the cursor is tinted with the brush colour.
+FILL_PREVIEW_ALPHA = 70
 
 
 def _merged_point(points: list[Point]) -> Point:
@@ -68,12 +71,16 @@ class Canvas(QWidget):
         self._drag_origin: QPointF | None = None
         self._drag_starts: list[tuple[Point, float, float]] = []
         self._preview_sharp = False
+        # Scope switch: edit/fill/mask across the whole image or the active layer.
+        self.scope = "layer"
+        # Fill preview: the region a click would fill, recomputed on a short delay.
+        self._fill_preview_path: QPainterPath | None = None
         self._hover: tuple[Stroke, int] | None = None
         self._hovered_stroke: Stroke | None = None
         self._recolor_dirty = False
 
         self.transform_mode = False
-        self._tr_index = -1
+        self._tr_layer: Layer | None = None
         self._tr_original: Layer | None = None
         self._tr_undo: Document | None = None
         self._tr_bbox = QRectF()
@@ -90,6 +97,7 @@ class Canvas(QWidget):
 
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.documentChanged.connect(self.clear_fill_preview)
 
     # --- document state -------------------------------------------------
     def set_document(self, document: Document) -> None:
@@ -112,7 +120,11 @@ class Canvas(QWidget):
         self.update()
 
     def push_undo(self) -> None:
-        self._undo_stack.append(self.doc.copy())
+        self.push_undo_snapshot(self.doc.copy())
+
+    def push_undo_snapshot(self, document: Document) -> None:
+        """Record an already taken snapshot, for actions that may be no-ops."""
+        self._undo_stack.append(document)
         if len(self._undo_stack) > 100:
             self._undo_stack.pop(0)
         self._redo_stack.clear()
@@ -202,22 +214,42 @@ class Canvas(QWidget):
             return None
         return layer
 
+    def editable_layers(self) -> list[Layer]:
+        """Vector layers the edit tools may touch, honouring the scope switch."""
+        if self.scope == "layer":
+            layer = self.active_vector_layer()
+            return [layer] if layer is not None else []
+        return [
+            layer for layer in self.doc.all_layers() if layer.visible and layer.kind == "vector"
+        ]
+
+    def set_scope(self, scope: str) -> None:
+        self.scope = "layer" if scope == "layer" else "image"
+        self.clear_selection()
+        self.clear_hover()
+        self.clear_fill_preview()
+        self.statusMessage.emit(f"scope: {'active layer' if self.scope == 'layer' else 'image'}")
+
     def clear_hover(self) -> None:
         self._hover = None
         self._hovered_stroke = None
         self.update()
 
+    def clear_fill_preview(self) -> None:
+        """Drop the highlighted figure; the next cursor move builds a new one."""
+        self._fill_preview_path = None
+        self.update()
+
     # --- point selection -------------------------------------------------
     def selected_points(self) -> list[Point]:
-        """Points of the active layer that are selected; stale refs are dropped."""
-        layer = self.active_vector_layer()
+        """Selected points; stale refs (deleted, other layer) are dropped."""
+        layers = self.editable_layers()
         valid: list[tuple[Stroke, int]] = []
-        if layer is not None:
-            for stroke, index in self._selected:
-                if any(item is stroke for item in layer.strokes) and 0 <= index < len(
-                    stroke.points
-                ):
-                    valid.append((stroke, index))
+        for stroke, index in self._selected:
+            if not 0 <= index < len(stroke.points):
+                continue
+            if any(any(item is stroke for item in layer.strokes) for layer in layers):
+                valid.append((stroke, index))
         self._selected = valid
         return [stroke.points[index] for stroke, index in valid]
 
@@ -243,17 +275,16 @@ class Canvas(QWidget):
         return list(self._selected)
 
     def _select_in_rect(self, rect: QRectF, add: bool) -> int:
-        layer = self.active_vector_layer()
-        if layer is None:
-            return 0
+        layers = self.editable_layers()
         if not add:
             self._selected = []
-        for stroke in layer.strokes:
-            for index, point in enumerate(stroke.points):
-                if rect.contains(QPointF(point.x, point.y)) and not self._is_selected(
-                    stroke, index
-                ):
-                    self._selected.append((stroke, index))
+        for layer in layers:
+            for stroke in layer.strokes:
+                for index, point in enumerate(stroke.points):
+                    if rect.contains(QPointF(point.x, point.y)) and not self._is_selected(
+                        stroke, index
+                    ):
+                        self._selected.append((stroke, index))
         self.update()
         return len(self._selected)
 
@@ -318,12 +349,13 @@ class Canvas(QWidget):
             draw_stroke(painter, preview if preview is not None else self._active_stroke)
 
         if self.tool in (self.TOOL_EDIT, self.TOOL_WIDTH, self.TOOL_ERASE):
-            layer = self.active_vector_layer()
-            if layer is not None:
+            if self.editable_layers():
                 self._draw_stroke_hover(painter)
-                self._draw_point_handles(painter, layer)
+                self._draw_point_handles(painter)
         elif self.tool == self.TOOL_RECOLOR:
             self._draw_recolor_overlay(painter)
+        elif self.tool == self.TOOL_FILL:
+            self._draw_fill_preview(painter)
 
         if self._box_start is not None and self._box_current is not None:
             rect = QRectF(self._box_start, self._box_current).normalized()
@@ -332,35 +364,38 @@ class Canvas(QWidget):
             painter.drawRect(rect)
             painter.setBrush(Qt.BrushStyle.NoBrush)
 
-    def _draw_point_handles(self, painter: QPainter, layer: Layer) -> None:
+    def _draw_point_handles(self, painter: QPainter) -> None:
         radius = 4.0 / self.zoom
         outline = QPen(QColor(0, 110, 220), 1.0 / self.zoom)
         selected_pen = QPen(QColor(255, 110, 20), 2.0 / self.zoom)
-        for stroke in layer.strokes:
-            for index, point in enumerate(stroke.points):
-                is_hovered = (
-                    self._hover is not None and self._hover[0] is stroke and self._hover[1] == index
-                )
-                is_selected = self._is_selected(stroke, index)
-                if is_selected:
-                    pen = selected_pen
-                    marker = radius * 1.3
-                else:
-                    pen = QPen(QColor(0, 170, 255), 2.5 / self.zoom) if is_hovered else outline
-                    marker = radius
-                if is_selected:
-                    brush = QColor(255, 140, 40)
-                else:
-                    brush = QColor(30, 30, 30) if point.smooth else QColor(255, 200, 60)
-                painter.setPen(pen)
-                painter.setBrush(brush)
-                if point.smooth:
-                    painter.drawEllipse(QPointF(point.x, point.y), marker, marker)
-                else:
-                    painter.drawRect(
-                        QRectF(point.x - marker, point.y - marker, marker * 2, marker * 2)
+        for layer in self.editable_layers():
+            for stroke in layer.strokes:
+                for index, point in enumerate(stroke.points):
+                    is_hovered = (
+                        self._hover is not None
+                        and self._hover[0] is stroke
+                        and self._hover[1] == index
                     )
-                painter.setBrush(Qt.BrushStyle.NoBrush)
+                    is_selected = self._is_selected(stroke, index)
+                    if is_selected:
+                        pen = selected_pen
+                        marker = radius * 1.3
+                    else:
+                        pen = QPen(QColor(0, 170, 255), 2.5 / self.zoom) if is_hovered else outline
+                        marker = radius
+                    if is_selected:
+                        brush = QColor(255, 140, 40)
+                    else:
+                        brush = QColor(30, 30, 30) if point.smooth else QColor(255, 200, 60)
+                    painter.setPen(pen)
+                    painter.setBrush(brush)
+                    if point.smooth:
+                        painter.drawEllipse(QPointF(point.x, point.y), marker, marker)
+                    else:
+                        painter.drawRect(
+                            QRectF(point.x - marker, point.y - marker, marker * 2, marker * 2)
+                        )
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
 
     def _draw_stroke_hover(self, painter: QPainter) -> None:
         stroke = self._hovered_stroke
@@ -404,7 +439,7 @@ class Canvas(QWidget):
             self._draw_stroke_preview(painter, stroke, preview, 0.0)
         layer = self.active_vector_layer()
         if layer is not None:
-            self._draw_point_handles(painter, layer)
+            self._draw_point_handles(painter)
 
     # --- transform mode -------------------------------------------------
     def begin_transform(self) -> bool:
@@ -412,13 +447,16 @@ class Canvas(QWidget):
             self.commit_transform()
         self.finish_stroke()
         layer = self.doc.layer()
+        if layer.is_group:
+            self.statusMessage.emit("transform: select a layer, not a group")
+            return False
         bounds = content_bounds(layer)
         if bounds is None:
             self.statusMessage.emit("nothing to transform")
             return False
 
         self.transform_mode = True
-        self._tr_index = self.doc.active_layer
+        self._tr_layer = layer
         self._tr_original = layer.copy()
         self._tr_undo = self.doc.copy()
         self._tr_bbox = bounds
@@ -459,15 +497,15 @@ class Canvas(QWidget):
     def cancel_transform(self) -> None:
         if not self.transform_mode:
             return
-        if self._tr_original is not None and 0 <= self._tr_index < len(self.doc.layers):
-            self.doc.layers[self._tr_index] = self._tr_original.copy()
+        if self._tr_layer is not None and self._tr_original is not None:
+            self._restore_layer(self._tr_layer, self._tr_original)
         self._clear_transform()
         self.documentChanged.emit()
         self.statusMessage.emit("transform cancelled")
 
     def _clear_transform(self) -> None:
         self.transform_mode = False
-        self._tr_index = -1
+        self._tr_layer = None
         self._tr_original = None
         self._tr_undo = None
         self._tr_action = None
@@ -498,16 +536,18 @@ class Canvas(QWidget):
             for corner in corners
         ]
 
+    @staticmethod
+    def _restore_layer(layer: Layer, original: Layer) -> None:
+        layer.strokes = [stroke.copy() for stroke in original.strokes]
+        layer.image_base64 = original.image_base64
+        layer._cached_image = None
+
     def _apply_live_transform(self) -> None:
-        if self._tr_original is None or not 0 <= self._tr_index < len(self.doc.layers):
-            return
-        layer = self.doc.layers[self._tr_index]
+        layer = self._tr_layer
         original = self._tr_original
-        if layer.kind == "raster":
-            layer.image_base64 = original.image_base64
-            layer._cached_image = None
-        else:
-            layer.strokes = [stroke.copy() for stroke in original.strokes]
+        if layer is None or original is None:
+            return
+        self._restore_layer(layer, original)
         apply_transform(
             layer,
             self._tr_angle,
@@ -644,6 +684,7 @@ class Canvas(QWidget):
         self._hovered_stroke = None
         self._cursor = None
         self._width_edit_key = None
+        self.clear_fill_preview()
         self.update()
 
     def mousePressEvent(self, event) -> None:
@@ -715,15 +756,20 @@ class Canvas(QWidget):
 
     def _fill_click(self, scene: QPointF) -> None:
         document = self.doc
-        self.push_undo()
         layer = document.layer()
-        if layer.kind != "raster":
-            index = document.active_layer
-            document.layers.insert(index, Layer("Fill", kind="raster"))
-            document.active_layer = index
-        target_index = document.active_layer
+        if layer.kind == "vector":
+            self._fill_vector_at(scene)
+            return
+        self.push_undo()
         if not fill.bucket_fill(
-            document, target_index, scene.x(), scene.y(), self.color, self.alpha
+            document,
+            layer,
+            scene.x(),
+            scene.y(),
+            self.color,
+            self.alpha,
+            self.scope,
+            layer.uid if self.scope == "layer" else "",
         ):
             self.undo()
             self.statusMessage.emit("fill: no closed region here")
@@ -732,31 +778,149 @@ class Canvas(QWidget):
         self.update()
         self.statusMessage.emit("filled")
 
+    def _fill_candidates(self) -> list[Stroke]:
+        """Strokes the fill tool may touch, honouring the scope switch."""
+        return [stroke for layer in self.editable_layers() for stroke in layer.strokes]
+
+    def _figure_path(self, figure: fill.Figure) -> QPainterPath:
+        """Closed path of the figure's own points, so the tint matches the line."""
+        if len(figure.points) < 3:
+            return QPainterPath()
+        probe = Stroke(
+            [point.copy() for point in figure.points],
+            self.color,
+            255,
+            figure.closed,
+            None,
+            255,
+            not figure.closed,
+        )
+        return stroke_path(probe)
+
+    def _figure_layer(self, figure: fill.Figure) -> Layer | None:
+        """Layer that owns the figure (the seed stroke decides)."""
+        seed = figure.strokes[0]
+        for layer in self.doc.all_layers():
+            if any(stroke is seed for stroke in layer.strokes):
+                return layer
+        return None
+
+    def _fill_vector_at(self, scene: QPointF) -> bool:
+        """Fill the figure under the cursor by duplicating its layer and filling the copy."""
+        document = self.doc
+        figure = fill.figure_at(self._fill_candidates(), scene.x(), scene.y())
+        if figure is None:
+            self.statusMessage.emit("fill: nothing here")
+            return False
+        path = self._figure_path(figure)
+        if path.isEmpty() or not path.contains(scene):
+            self.statusMessage.emit("fill: no closed region here")
+            return False
+        owner = self._figure_layer(figure)
+        if owner is None:
+            return False
+        duplicate = owner.duplicate()
+        duplicate.name = f"Fill {len(document.walk())}"
+        positions = [
+            position
+            for position, stroke in enumerate(owner.strokes)
+            if any(stroke is item for item in figure.strokes)
+        ]
+        self.push_undo()
+        if len(figure.strokes) == 1:
+            target = duplicate.strokes[positions[0]]
+            target.bridge = not target.closed
+            target.fill = self.color
+            target.fill_alpha = self.alpha
+        elif positions:
+            # Several strokes form the outline: one merged, still editable, stroke.
+            merged = Stroke(
+                [Point(point.x, point.y, 0.0, point.smooth) for point in figure.points],
+                self.color,
+                255,
+                figure.closed,
+                self.color,
+                self.alpha,
+                not figure.closed,
+            )
+            for position in sorted(positions, reverse=True):
+                del duplicate.strokes[position]
+            duplicate.strokes.insert(min(positions), merged)
+        document.active_layer = document.insert_below(owner, duplicate)
+        self.clear_selection()
+        self.clear_fill_preview()
+        self.statusMessage.emit(f"fill layer created ({len(figure.strokes)} stroke(s))")
+        self.documentChanged.emit()
+        self.update()
+        return True
+
+    # --- fill preview ---------------------------------------------------
+    def request_fill_preview(self, scene: QPointF) -> None:
+        """Highlight the figure a click would fill; geometry only, no rasterising."""
+        figure = fill.figure_at(self._fill_candidates(), scene.x(), scene.y())
+        path = self._figure_path(figure) if figure is not None else QPainterPath()
+        if path.isEmpty() or not path.contains(scene):
+            self._fill_preview_path = None
+        else:
+            self._fill_preview_path = path
+        self.update()
+
+    def _draw_fill_preview(self, painter: QPainter) -> None:
+        path = self._fill_preview_path
+        if path is None:
+            return
+        tint = QColor(self.color[0], self.color[1], self.color[2], FILL_PREVIEW_ALPHA)
+        painter.fillPath(path, tint)
+
+    def convert_to_fill(self) -> bool:
+        """Copy the active layer's outline into a filled vector layer below it."""
+        document = self.doc
+        source = document.layer()
+        strokes = [stroke for stroke in source.strokes if len(stroke.points) >= 3]
+        if source.kind != "vector" or not strokes:
+            self.statusMessage.emit("convert: layer has no closed outline")
+            return False
+        copies: list[Stroke] = []
+        for stroke in strokes:
+            copy = stroke.copy()
+            copy.closed = True
+            for point in copy.points:
+                point.width = 0.0
+            copy.fill = self.color
+            copy.fill_alpha = self.alpha
+            copies.append(copy)
+        filled = Layer(name="Fill", kind="vector", strokes=copies)
+        self.push_undo()
+        document.active_layer = document.insert_below(source, filled)
+        self.clear_selection()
+        self.statusMessage.emit("vector converted to fill")
+        self.documentChanged.emit()
+        self.update()
+        return True
+
     def _stroke_at(self, scene: QPointF) -> Stroke | None:
-        """Closest stroke of the active layer, thickness taken into account."""
-        layer = self.active_vector_layer()
-        if layer is None:
-            return None
+        """Closest stroke of the editable layers, thickness taken into account."""
         best: tuple[Stroke | None, float] = (None, float("inf"))
-        for stroke in layer.strokes:
-            if not stroke.points:
-                continue
-            if len(stroke.points) == 1:
-                # A single-point stroke is drawn as a dot, so it has no curve to
-                # measure against. Hit-test the point itself.
-                point = stroke.points[0]
-                distance = math.hypot(point.x - scene.x(), point.y - scene.y())
-                limit = max(self.hit_radius(), point.width / 2.0)
-            else:
-                index, t, distance, _x, _y = nearest_curve_point(stroke, scene.x(), scene.y())
-                if index < 0:
+        for layer in self.editable_layers():
+            for stroke in layer.strokes:
+                if not stroke.points:
                     continue
-                start = stroke.points[index]
-                end = stroke.points[index + 1]
-                width = start.width + (end.width - start.width) * t
-                limit = max(self.hit_radius(), width / 2.0)
-            if distance <= limit and distance < best[1]:
-                best = (stroke, distance)
+                if len(stroke.points) == 1:
+                    # A single-point stroke is drawn as a dot, so it has no curve to
+                    # measure against. Hit-test the point itself.
+                    point = stroke.points[0]
+                    distance = math.hypot(point.x - scene.x(), point.y - scene.y())
+                    limit = max(self.hit_radius(), point.width / 2.0)
+                else:
+                    index, t, distance, _x, _y = nearest_curve_point(stroke, scene.x(), scene.y())
+                    if index < 0:
+                        continue
+                    start = stroke.points[index]
+                    end = stroke.points[(index + 1) % len(stroke.points)]
+                    width = start.width + (end.width - start.width) * t
+                    limit = max(self.hit_radius(), width / 2.0)
+                if distance <= limit and distance < best[1]:
+                    best = (stroke, distance)
         return best[0]
 
     def _recolor_gesture(self, scene: QPointF) -> None:
@@ -772,6 +936,8 @@ class Canvas(QWidget):
             self._recolor_dirty = True
         stroke.color = color
         stroke.alpha = alpha
+        if stroke.fill is not None:
+            stroke.fill = color
         self.statusMessage.emit(f"recolored stroke: rgb{color} alpha {alpha}")
         self.documentChanged.emit()
         self.update()
@@ -838,6 +1004,11 @@ class Canvas(QWidget):
                 if hovered is not None:
                     self.statusMessage.emit(f"recolor: {self.doc.layer().name}")
                 self.update()
+            return
+
+        if self.tool == self.TOOL_FILL:
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                self.request_fill_preview(scene)
             return
 
         if self.tool in (self.TOOL_EDIT, self.TOOL_WIDTH, self.TOOL_ERASE):
@@ -925,12 +1096,13 @@ class Canvas(QWidget):
             self._width_edit_key = None
             return False
         stroke, index = target
-        layer = self.active_vector_layer()
-        if layer is None or not any(item is stroke for item in layer.strokes):
-            self._hover = None
+        if not 0 <= index < len(stroke.points):
             self._width_edit_key = None
             return False
-        if not 0 <= index < len(stroke.points):
+        if not any(
+            any(item is stroke for item in layer.strokes) for layer in self.editable_layers()
+        ):
+            self._hover = None
             self._width_edit_key = None
             return False
         if self._is_selected(stroke, index):
@@ -1079,34 +1251,37 @@ class Canvas(QWidget):
     def delete_selected(self) -> bool:
         """Remove every selected point; strokes split at the gaps."""
         targets = self._valid_selected()
-        layer = self.active_vector_layer()
-        if not targets or layer is None:
+        layers = self.editable_layers()
+        if not targets or not layers:
             self.statusMessage.emit("delete: nothing selected")
             return False
         removed: dict[int, set[int]] = {}
         for stroke, index in targets:
             removed.setdefault(id(stroke), set()).add(index)
         self.push_undo()
-        new_strokes: list[Stroke] = []
-        for stroke in layer.strokes:
-            indices = removed.get(id(stroke))
-            if not indices:
-                new_strokes.append(stroke)
+        for layer in layers:
+            if not any(id(stroke) in removed for stroke in layer.strokes):
                 continue
-            groups: list[list[Point]] = []
-            current: list[Point] = []
-            for index, point in enumerate(stroke.points):
-                if index in indices:
-                    if current:
-                        groups.append(current)
-                    current = []
-                else:
-                    current.append(point)
-            if current:
-                groups.append(current)
-            for group in groups:
-                new_strokes.append(Stroke(group, stroke.color, stroke.alpha))
-        layer.strokes = new_strokes
+            new_strokes: list[Stroke] = []
+            for stroke in layer.strokes:
+                indices = removed.get(id(stroke))
+                if not indices:
+                    new_strokes.append(stroke)
+                    continue
+                groups: list[list[Point]] = []
+                current: list[Point] = []
+                for index, point in enumerate(stroke.points):
+                    if index in indices:
+                        if current:
+                            groups.append(current)
+                        current = []
+                    else:
+                        current.append(point)
+                if current:
+                    groups.append(current)
+                for group in groups:
+                    new_strokes.append(Stroke(group, stroke.color, stroke.alpha))
+            layer.strokes = new_strokes
         self._selected = []
         self._hover = None
         self.statusMessage.emit(f"deleted {len(targets)} point(s)")
@@ -1120,13 +1295,20 @@ class Canvas(QWidget):
         if len(targets) < 2:
             self.statusMessage.emit("merge: select at least two points")
             return False
-        layer = self.active_vector_layer()
-        if layer is None:
-            return False
         strokes: list[Stroke] = []
         for stroke, _index in targets:
             if not any(item is stroke for item in strokes):
                 strokes.append(stroke)
+        layer = None
+        for candidate in self.editable_layers():
+            if any(item is strokes[0] for item in candidate.strokes):
+                layer = candidate
+                break
+        if layer is None:
+            return False
+        if any(not any(item is stroke for item in layer.strokes) for stroke in strokes):
+            self.statusMessage.emit("merge: strokes must be on one layer")
+            return False
         if len(strokes) == 1:
             return self._merge_within_stroke(targets)
         return self._merge_across_strokes(targets, layer, strokes)
@@ -1227,6 +1409,8 @@ class Canvas(QWidget):
         close = menu.addAction("Close Stroke")
         delete = menu.addAction("Delete Selected Points (Del)")
         menu.addSeparator()
+        convert = menu.addAction("Convert to Fill")
+        menu.addSeparator()
         clear = menu.addAction("Deselect All (Esc)")
         chosen = menu.exec(event.globalPosition().toPoint())
         if chosen is merge:
@@ -1235,19 +1419,19 @@ class Canvas(QWidget):
             self.close_selected_strokes()
         elif chosen is delete:
             self.delete_selected()
+        elif chosen is convert:
+            self.convert_to_fill()
         elif chosen is clear:
             self.clear_selection()
 
     def _insert_point(self, scene: QPointF) -> bool:
         radius = self.hit_radius()
-        layer = self.active_vector_layer()
-        if layer is None:
-            return False
         best: tuple[Stroke, int, float, float, float, float] | None = None
-        for stroke in layer.strokes:
-            index, t, distance, x, y = nearest_curve_point(stroke, scene.x(), scene.y())
-            if index >= 0 and (best is None or distance < best[2]):
-                best = (stroke, index, distance, t, x, y)
+        for layer in self.editable_layers():
+            for stroke in layer.strokes:
+                index, t, distance, x, y = nearest_curve_point(stroke, scene.x(), scene.y())
+                if index >= 0 and (best is None or distance < best[2]):
+                    best = (stroke, index, distance, t, x, y)
         if best is None or best[2] > radius:
             return False
 
@@ -1272,37 +1456,52 @@ class Canvas(QWidget):
     def _find_point(self, scene: QPointF) -> tuple[Stroke | None, int]:
         radius = self.hit_radius()
         best: tuple[Stroke | None, int, float] = (None, -1, radius)
-        layer = self.active_vector_layer()
-        if layer is None:
-            return best[0], best[1]
-        for stroke in layer.strokes:
-            index, distance = nearest_point(stroke, scene.x(), scene.y())
-            if index >= 0 and distance < best[2]:
-                best = (stroke, index, distance)
+        for layer in self.editable_layers():
+            for stroke in layer.strokes:
+                index, distance = nearest_point(stroke, scene.x(), scene.y())
+                if index >= 0 and distance < best[2]:
+                    best = (stroke, index, distance)
         return best[0], best[1]
 
     def _erase_at(self, scene: QPointF) -> None:
         radius = self.hit_radius()
-        layer = self.doc.layer()
         changed = False
-        new_strokes: list[Stroke] = []
-        for stroke in layer.strokes:
-            groups: list[list[Point]] = []
-            current: list[Point] = []
-            for point in stroke.points:
-                if math.hypot(point.x - scene.x(), point.y - scene.y()) <= radius:
-                    changed = True
-                    if current:
-                        groups.append(current)
-                        current = []
-                else:
-                    current.append(point)
-            if current:
-                groups.append(current)
-            for group in groups:
-                new_strokes.append(Stroke(group, stroke.color, stroke.alpha))
+        for layer in self.editable_layers():
+            new_strokes: list[Stroke] = []
+            layer_changed = False
+            for stroke in layer.strokes:
+                groups: list[list[Point]] = []
+                current: list[Point] = []
+                hit = False
+                for point in stroke.points:
+                    if math.hypot(point.x - scene.x(), point.y - scene.y()) <= radius:
+                        hit = True
+                        if current:
+                            groups.append(current)
+                            current = []
+                    else:
+                        current.append(point)
+                if current:
+                    groups.append(current)
+                if not hit:
+                    new_strokes.append(stroke)
+                    continue
+                layer_changed = True
+                for group in groups:
+                    new_strokes.append(
+                        Stroke(
+                            group,
+                            stroke.color,
+                            stroke.alpha,
+                            stroke.closed and len(groups) == 1,
+                            stroke.fill,
+                            stroke.fill_alpha,
+                        )
+                    )
+            if layer_changed:
+                layer.strokes = new_strokes
+                changed = True
         if changed:
-            layer.strokes = new_strokes
             self._hover = None
             self.documentChanged.emit()
             self.update()

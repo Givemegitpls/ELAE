@@ -3,10 +3,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
 from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
 from . import io
 from .canvas import Canvas
 from .model import Document, Layer
+from .render import layers_image
 
 
 class LayerTree(QTreeWidget):
@@ -51,6 +53,8 @@ class LayerTree(QTreeWidget):
         self.setDropIndicatorShown(True)
         self.document: Document | None = None
         self.on_drop: Callable[[list[Layer], int], bool] | None = None
+        self.on_drag_started: Callable[[], None] | None = None
+        self.on_drag_finished: Callable[[], None] | None = None
         # Shift-range anchor: the layer of the last plain/Ctrl click.
         self.anchor: Layer | None = None
 
@@ -59,6 +63,12 @@ class LayerTree(QTreeWidget):
             return None
         layer = item.data(0, Qt.ItemDataRole.UserRole)
         return layer if isinstance(layer, Layer) else None
+
+    def set_current_item(self, item: QTreeWidgetItem) -> None:
+        """Make ``item`` current without QTreeWidget clearing the selection."""
+        self.selectionModel().setCurrentIndex(
+            self.indexFromItem(item), QItemSelectionModel.SelectionFlag.NoUpdate
+        )
 
     def ordered_items(self) -> list[QTreeWidgetItem]:
         """Items in draw order (same walk as Document.walk)."""
@@ -99,6 +109,19 @@ class LayerTree(QTreeWidget):
             item.setSelected(True)
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            # Keep a multi-selection when the click lands on one of its items, so
+            # the context menu can group/merge exactly what is selected.
+            item = self.itemAt(event.position().toPoint())
+            layer = self.item_layer(item)
+            if item is not None and layer is not None:
+                if not item.isSelected():
+                    self.clearSelection()
+                    item.setSelected(True)
+                self.set_current_item(item)
+                self.anchor = layer
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             layer = self.item_layer(self.itemAt(event.position().toPoint()))
             if event.modifiers() & Qt.KeyboardModifier.ShiftModifier and layer is not None:
@@ -108,6 +131,19 @@ class LayerTree(QTreeWidget):
             if layer is not None:
                 self.anchor = layer
         super().mousePressEvent(event)
+
+    def startDrag(self, supported_actions) -> None:
+        """Run the internal move, then let the window resync the tree.
+
+        Qt deletes the dragged rows from the view after a successful internal
+        move; the document is the source of truth, so the panel must be rebuilt
+        from the model or the dropped layers appear to vanish.
+        """
+        if self.on_drag_started is not None:
+            self.on_drag_started()
+        super().startDrag(supported_actions)
+        if self.on_drag_finished is not None:
+            self.on_drag_finished()
 
     def drop_target(
         self,
@@ -269,6 +305,9 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.canvas)
         self._path: Path | None = None
         self._refreshing = False
+        self._dragging_layers = False
+        self._drag_selection: list[Layer] = []
+        self._dropped_layers: list[Layer] = []
 
         self._build_toolbar()
         self._build_layers_dock()
@@ -343,6 +382,15 @@ class MainWindow(QMainWindow):
         self._scope_action.toggled.connect(self._on_scope_toggled)
         bar.addAction(self._scope_action)
 
+        bar.addSeparator()
+        self._raster_toggle = QCheckBox("Raster view", self)
+        self._raster_toggle.setToolTip(
+            "Render the document once at 1:1 PNG resolution and show the cached image "
+            "(unchecked: live vectors). Small details show the real PNG pixel grid."
+        )
+        self._raster_toggle.toggled.connect(self._on_raster_toggled)
+        bar.addWidget(self._raster_toggle)
+
     def _build_layers_dock(self) -> None:
         dock = QDockWidget("Layers", self)
         dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable)
@@ -352,6 +400,8 @@ class MainWindow(QMainWindow):
 
         self._layer_list = LayerTree(panel)
         self._layer_list.on_drop = self._drop_layers
+        self._layer_list.on_drag_started = self._on_layer_drag_started
+        self._layer_list.on_drag_finished = self._on_layer_drag_finished
         self._layer_list.currentItemChanged.connect(self._on_layer_selected)
         self._layer_list.itemChanged.connect(self._on_layer_item_changed)
         self._layer_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -365,11 +415,12 @@ class MainWindow(QMainWindow):
             ("dup", self._duplicate_layer),
             ("grp", self._group_layer),
             ("ung", self._ungroup_layer),
+            ("mrg", self._merge_layers),
             ("^", lambda: self._move_layer(-1)),
             ("v", lambda: self._move_layer(1)),
         ):
             button = QPushButton(label, panel)
-            button.setFixedWidth(36 if label in ("dup", "grp", "ung") else 28)
+            button.setFixedWidth(36 if label in ("dup", "grp", "ung", "mrg") else 28)
             button.clicked.connect(slot)
             buttons.addWidget(button)
         buttons.addStretch(1)
@@ -475,6 +526,9 @@ class MainWindow(QMainWindow):
             "ungroup": self._window_action(
                 "Ungroup", self._ungroup_layer, QKeySequence("Ctrl+Shift+G")
             ),
+            "merge": self._window_action(
+                "Merge Layers", self._merge_layers, QKeySequence("Ctrl+E")
+            ),
             "up": self._window_action("Move Up", lambda: self._move_layer(-1)),
             "down": self._window_action("Move Down", lambda: self._move_layer(1)),
         }
@@ -499,13 +553,14 @@ class MainWindow(QMainWindow):
             if not item.isSelected():
                 self._layer_list.clearSelection()
                 item.setSelected(True)
-            self._layer_list.setCurrentItem(item)
+            self._layer_list.set_current_item(item)
             menu.addAction(self._layer_actions["duplicate"])
             menu.addAction(self._layer_actions["rename"])
             menu.addAction(self._layer_actions["delete"])
             menu.addSeparator()
             menu.addAction(self._layer_actions["group"])
             menu.addAction(self._layer_actions["ungroup"])
+            menu.addAction(self._layer_actions["merge"])
             menu.addAction(self._layer_actions["up"])
             menu.addAction(self._layer_actions["down"])
             menu.addSeparator()
@@ -626,11 +681,14 @@ class MainWindow(QMainWindow):
         active = document.layer()
         item = self._layer_items.get(id(active))
         if item is not None:
-            tree.setCurrentItem(item)
+            tree.set_current_item(item)
+            if not tree.selectedItems():
+                item.setSelected(True)
         if tree.anchor is None or id(tree.anchor) not in self._layer_items:
             tree.anchor = active
         self._refresh_layer_properties()
         self._refreshing = False
+        self.canvas.invalidate_raster_view()
         self.canvas.update()
 
     def _refresh_layer_properties(self) -> None:
@@ -678,6 +736,7 @@ class MainWindow(QMainWindow):
         visible = item.checkState(0) == Qt.CheckState.Checked
         if visible != layer.visible:
             layer.visible = visible
+            self.canvas.invalidate_raster_view()
             self.canvas.clear_hover()
             self.canvas.update()
         name = item.text(0).strip()
@@ -690,18 +749,21 @@ class MainWindow(QMainWindow):
         if self._refreshing:
             return
         self.canvas.doc.layer().opacity = value / 100.0
+        self.canvas.invalidate_raster_view()
         self.canvas.update()
 
     def _on_blend_changed(self, value: str) -> None:
         if self._refreshing:
             return
         self.canvas.doc.layer().blend = value
+        self.canvas.invalidate_raster_view()
         self.canvas.update()
 
     def _on_clip_changed(self, value: str) -> None:
         if self._refreshing:
             return
         self.canvas.doc.layer().clip = value
+        self.canvas.invalidate_raster_view()
         self.canvas.update()
 
     def _add_layer(self) -> None:
@@ -728,7 +790,7 @@ class MainWindow(QMainWindow):
 
     def _group_layer(self) -> None:
         document = self.canvas.doc
-        layers = self._selected_layers()
+        layers = document.selection_roots(self._selected_layers())
         if not layers:
             self.statusBar().showMessage("select layers to group")
             return
@@ -757,7 +819,7 @@ class MainWindow(QMainWindow):
     def _drop_layers(self, siblings: list[Layer], index: int) -> bool:
         """Drag&drop from the tree: move the selection into ``siblings`` at ``index``."""
         document = self.canvas.doc
-        layers = self._selected_layers()
+        layers = document.selection_roots(self._selected_layers())
         if not layers:
             return False
         active = document.layer()
@@ -768,9 +830,52 @@ class MainWindow(QMainWindow):
         self.canvas.push_undo_snapshot(snapshot)
         document.active_layer = document.walk_index(active)
         self.canvas.clear_hover()
-        self._refresh_layers(moved)
+        self._dropped_layers = moved
+        if not self._dragging_layers:
+            self._refresh_layers(moved)
         self.statusBar().showMessage(f"moved {len(moved)} layer(s)")
         return True
+
+    def _on_layer_drag_started(self) -> None:
+        self._dragging_layers = True
+        self._drag_selection = self._selected_layers()
+        self._dropped_layers = []
+
+    def _on_layer_drag_finished(self) -> None:
+        # Qt removes the source rows from an internal move after the drop, even
+        # though the document already changed. Rebuild the panel from the model.
+        self._dragging_layers = False
+        selection = self._dropped_layers or self._drag_selection
+        self._drag_selection = []
+        self._dropped_layers = []
+        self._refresh_layers(selection)
+
+    def _merge_layers(self) -> None:
+        """Merge the selection into one layer: vectors stay vectors, the rest rasterises."""
+        document = self.canvas.doc
+        roots = document.selection_roots(self._selected_layers())
+        mergeable = len(roots) >= 2 or (len(roots) == 1 and roots[0].is_group)
+        if not mergeable:
+            self.statusBar().showMessage("select at least two layers (or a group) to merge")
+            return
+        self.canvas.push_undo()
+        active = document.layer()
+        name = active.name if any(active is root for root in roots) else roots[0].name
+        merged = document.merge_layers(roots, name)
+        if merged is None:
+            image = layers_image(document, roots)
+            merged = Layer(
+                name=name,
+                kind="raster",
+                image_base64=io.encode_image(image),
+            )
+            document.replace_layers(roots, merged)
+        document.active_layer = document.walk_index(merged)
+        self.canvas.clear_hover()
+        self.canvas.clear_selection()
+        self._refresh_layers([merged])
+        self.statusBar().showMessage(f"merged {len(roots)} layer(s)")
+        self.canvas.update()
 
     def _rename_layer(self) -> None:
         item = self._layer_list.currentItem()
@@ -915,6 +1020,7 @@ class MainWindow(QMainWindow):
         self.canvas.push_undo()
         self.canvas.doc.width = width
         self.canvas.doc.height = height
+        self.canvas.invalidate_raster_view()
         self.canvas.update()
 
     # --- edit -----------------------------------------------------------
@@ -937,6 +1043,10 @@ class MainWindow(QMainWindow):
     def _on_scope_toggled(self, checked: bool) -> None:
         self.canvas.set_scope("image" if checked else "layer")
         self._scope_action.setText("Scope: image" if checked else "Scope: layer")
+
+    def _on_raster_toggled(self, checked: bool) -> None:
+        self.canvas.set_raster_view(checked)
+        self.canvas.setFocus()
 
     def _convert_to_fill(self) -> None:
         self.canvas.setFocus()

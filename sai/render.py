@@ -4,7 +4,7 @@ import itertools
 import math
 
 from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QTransform
 
 from .geometry import sample_stroke
 from .model import Document, Layer, Stroke
@@ -227,6 +227,19 @@ def _clip_mask(
     return result
 
 
+def _device_scale(transform: QTransform | None) -> float | None:
+    """Uniform positive scale of an axis-aligned painter transform, if any."""
+    if transform is None:
+        return None
+    if abs(transform.m12()) > 1e-6 or abs(transform.m21()) > 1e-6:
+        return None
+    scale_x = transform.m11()
+    scale_y = transform.m22()
+    if scale_x <= 0 or scale_y <= 0 or abs(scale_x - scale_y) > 1e-6:
+        return None
+    return scale_x
+
+
 def _render_masked(
     document: Document,
     layer: Layer,
@@ -234,8 +247,15 @@ def _render_masked(
     mask: tuple[QImage, QRectF, float],
     clip: str,
     view: QRectF | None = None,
-) -> tuple[QImage, QRectF] | None:
-    """Render a clipped layer into a cropped buffer and apply the base mask."""
+    transform: QTransform | None = None,
+) -> tuple[QImage, QRectF, bool] | None:
+    """Render a clipped layer into a cropped buffer and apply the base mask.
+
+    For an axis-aligned view the buffer is rendered directly at device scale and
+    its origin snapped to whole device pixels. Otherwise rounding the blit rect
+    shifts the clipped content by up to half a pixel, which is visible as an
+    uneven outline where a thin clipped layer sits over a sharp one.
+    """
     mask_image, mask_bounds, scale = mask
     page = QRectF(0, 0, document.width, document.height)
     bounds = node_bounds(layer)
@@ -248,34 +268,58 @@ def _render_masked(
         rect = rect.intersected(view)
     if rect.width() < 0.5 or rect.height() < 0.5:
         return None
-    width = max(1, round(rect.width() * scale))
-    height = max(1, round(rect.height() * scale))
+
+    device_scale = _device_scale(transform)
+    device_rect: QRectF | None = None
+    if device_scale is not None and transform is not None:
+        device = transform.mapRect(rect)
+        device_rect = QRectF(
+            round(device.x()),
+            round(device.y()),
+            max(1, round(device.width())),
+            max(1, round(device.height())),
+        )
+        rect = transform.inverted()[0].mapRect(device_rect)
+        width = round(device_rect.width())
+        height = round(device_rect.height())
+        buffer_scale = device_scale
+    else:
+        width = max(1, round(rect.width() * scale))
+        height = max(1, round(rect.height() * scale))
+        buffer_scale = scale
+
     buffer = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
     buffer.fill(Qt.GlobalColor.transparent)
     painter = QPainter(buffer)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    painter.scale(scale, scale)
+    painter.scale(buffer_scale, buffer_scale)
     painter.translate(-rect.left(), -rect.top())
-    _draw_node(painter, layer, document, None, skip_stroke, composed=False, scale=scale)
+    _draw_node(painter, layer, document, None, skip_stroke, composed=False, scale=buffer_scale)
     # Compose the mask in device pixels; it may sit inside the larger buffer.
     painter.resetTransform()
-    offset_x = (mask_bounds.x() - rect.x()) * scale
-    offset_y = (mask_bounds.y() - rect.y()) * scale
+    offset_x = (mask_bounds.x() - rect.x()) * buffer_scale
+    offset_y = (mask_bounds.y() - rect.y()) * buffer_scale
+    mask_rect = QRectF(
+        offset_x,
+        offset_y,
+        mask_bounds.width() * buffer_scale,
+        mask_bounds.height() * buffer_scale,
+    )
     if clip == "outside":
         # Everything outside the mask image is "outside the base" already.
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOut)
-        painter.drawImage(QPointF(offset_x, offset_y), mask_image)
+        painter.drawImage(mask_rect, mask_image)
     else:
         # "inside" must also clear whatever lies outside the mask rectangle.
         full = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
         full.fill(Qt.GlobalColor.transparent)
         full_painter = QPainter(full)
-        full_painter.drawImage(QPointF(offset_x, offset_y), mask_image)
+        full_painter.drawImage(mask_rect, mask_image)
         full_painter.end()
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
         painter.drawImage(QPointF(0, 0), full)
     painter.end()
-    return buffer, rect
+    return buffer, device_rect if device_rect is not None else rect, device_rect is not None
 
 
 def _draw_image(
@@ -290,8 +334,16 @@ def _draw_image(
     painter.restore()
 
 
-def _draw_buffer(painter: QPainter, rect: QRectF, buffer: QImage) -> None:
+def _draw_buffer(
+    painter: QPainter, rect: QRectF, buffer: QImage, device_rect: bool = False
+) -> None:
     """Draw a clip buffer 1:1 in device pixels, so its AA edge is not resampled."""
+    if device_rect:
+        painter.save()
+        painter.resetTransform()
+        painter.drawImage(rect, buffer)
+        painter.restore()
+        return
     transform = painter.transform()
     axis_aligned = abs(transform.m12()) < 1e-6 and abs(transform.m21()) < 1e-6
     if not axis_aligned:
@@ -370,14 +422,20 @@ def _draw_stack(
                 if not clipped_layer.visible:
                     continue
                 masked = _render_masked(
-                    document, clipped_layer, skip_stroke, mask, clipped_layer.clip, view
+                    document,
+                    clipped_layer,
+                    skip_stroke,
+                    mask,
+                    clipped_layer.clip,
+                    view,
+                    painter.transform(),
                 )
                 if masked is None:
                     continue
-                buffer, rect = masked
+                buffer, rect, device_rect = masked
                 painter.save()
                 _apply_composition(painter, clipped_layer, background)
-                _draw_buffer(painter, rect, buffer)
+                _draw_buffer(painter, rect, buffer, device_rect)
                 painter.restore()
 
         index = cursor
@@ -399,3 +457,18 @@ def draw_document(
     if background is not None:
         painter.fillRect(QRectF(0, 0, document.width, document.height), background)
     _draw_stack(painter, document.layers, document, background, skip_stroke, scale, view)
+
+
+def layers_image(document: Document, layers: list[Layer], scale: float = 1.0) -> QImage:
+    """Render a subset of nodes as a standalone stack, for merging to a raster layer."""
+    width = max(1, round(document.width * scale))
+    height = max(1, round(document.height * scale))
+    image = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.scale(scale, scale)
+    subset = Document(width=document.width, height=document.height, layers=list(layers))
+    draw_document(painter, subset, scale=scale)
+    painter.end()
+    return image

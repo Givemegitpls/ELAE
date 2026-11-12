@@ -473,6 +473,7 @@ class RenderTests(unittest.TestCase):
         image = QImage(document.width, document.height, QImage.Format.Format_ARGB32_Premultiplied)
         image.fill(Qt.GlobalColor.transparent)
         painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         draw_document(painter, document)
         painter.end()
         return image
@@ -625,6 +626,23 @@ class RenderTests(unittest.TestCase):
         ]
         image = self._render(document)
         self.assertGreater(image.pixelColor(80, 20).alpha(), 0)
+
+    def test_clipped_layer_keeps_its_pixel_position(self) -> None:
+        # An empty (transparent) base must leave the clipped layer untouched.
+        # The buffer used to be blitted after rounding its device rect, which
+        # shifted a clipped layer by up to half a pixel and made a thin clipped
+        # ring look thicker on one side.
+        point = Point(38.11696825312951, 27.671961870690808, 13)
+
+        def render(clip: str) -> QImage:
+            document = Document(60, 60)
+            document.layers = [
+                Layer("base"),
+                Layer("dot", [Stroke([point.copy()], (144, 144, 144))], clip=clip),
+            ]
+            return self._render(document)
+
+        self.assertEqual(render("outside"), render("off"))
 
     def test_walk_lists_groups_with_depth(self) -> None:
         document = Document(32, 32)
@@ -1241,6 +1259,37 @@ class CanvasTests(unittest.TestCase):
         canvas.redo()
         self.assertEqual(len(canvas.doc.layer().strokes), 1)
 
+    def test_raster_view_caches_the_document_at_1x(self) -> None:
+        document = Document(100, 60)
+        document.layer().strokes.append(Stroke([Point(10, 20, 6), Point(90, 20, 6)]))
+        canvas = Canvas(document)
+        canvas.set_raster_view(True)
+        image = canvas._raster_image()
+        self.assertEqual((image.width(), image.height()), (100, 60))
+        self.assertGreater(image.pixelColor(50, 20).alpha(), 0)
+        self.assertIs(canvas._raster_image(), image)
+        canvas.documentChanged.emit()
+        self.assertIsNone(canvas._raster_cache)
+        canvas.set_raster_view(False)
+
+    def test_raster_view_caps_only_oversized_pages(self) -> None:
+        self.assertEqual(Canvas(Document(1000, 1000))._raster_scale(), 1.0)
+        self.assertLess(Canvas(Document(8000, 8000))._raster_scale(), 1.0)
+
+    def test_raster_view_matches_the_vector_view_at_1x(self) -> None:
+        document = Document(100, 60)
+        document.layer().strokes.append(Stroke([Point(10, 20, 6), Point(90, 20, 6)]))
+        canvas = Canvas(document)
+        canvas.resize(200, 150)
+        canvas.pan = QPointF(20, 30)
+        canvas.zoom = 1.0
+        canvas.set_raster_view(False)
+        vector = canvas.grab().toImage()
+        canvas.set_raster_view(True)
+        raster = canvas.grab().toImage()
+        self.assertEqual(raster, vector)
+        canvas.set_raster_view(False)
+
     def test_wheel_width_change_is_undoable(self) -> None:
         canvas = Canvas(Document())
         stroke = Stroke([Point(0, 0, 4), Point(50, 0, 4)])
@@ -1693,6 +1742,14 @@ class LayerPanelTests(unittest.TestCase):
         window._refresh_layers()
         self.assertFalse(window._clip.isEnabled())
 
+    def test_raster_view_checkbox_toggles_the_canvas(self) -> None:
+        window = self._window()
+        self.assertFalse(window.canvas.raster_view)
+        window._raster_toggle.setChecked(True)
+        self.assertTrue(window.canvas.raster_view)
+        window._raster_toggle.setChecked(False)
+        self.assertFalse(window.canvas.raster_view)
+
     def test_duplicate_layer_copies_content_independently(self) -> None:
         window = self._window()
         document = window.canvas.doc
@@ -1806,6 +1863,125 @@ class LayerPanelTests(unittest.TestCase):
         self.assertIs(tree.topLevelItem(0), first)
         self.assertIs(tree.topLevelItem(1), second)
         self.assertEqual(document.layer().name, "b")
+
+    def test_right_click_keeps_the_multi_selection(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers = [Layer("a"), Layer("b")]
+        window.resize(900, 600)
+        window.show()
+        window._refresh_layers()
+        self._select(window, list(document.layers))
+        tree = window._layer_list
+        item = window._layer_items[id(document.layers[0])]
+        rect = tree.visualItemRect(item)
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(rect.center()),
+            QPointF(rect.center()),
+            Qt.MouseButton.RightButton,
+            Qt.MouseButton.RightButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        tree.mousePressEvent(event)
+        self.assertEqual(self._selected_names(window), ["a", "b"])
+        self.assertIs(document.layer(), document.layers[0])
+
+    def test_right_click_on_an_unselected_layer_selects_only_it(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers = [Layer("a"), Layer("b")]
+        window.resize(900, 600)
+        window.show()
+        window._refresh_layers()
+        self._select(window, [document.layers[0]])
+        tree = window._layer_list
+        item = window._layer_items[id(document.layers[1])]
+        rect = tree.visualItemRect(item)
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(rect.center()),
+            QPointF(rect.center()),
+            Qt.MouseButton.RightButton,
+            Qt.MouseButton.RightButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        tree.mousePressEvent(event)
+        self.assertEqual(self._selected_names(window), ["b"])
+
+    def test_merge_vector_layers_keeps_editable_strokes(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        first = Layer("a", [Stroke([Point(0, 0, 2), Point(10, 0, 2)])])
+        second = Layer("b", [Stroke([Point(0, 10, 2), Point(10, 10, 2)])])
+        document.layers = [first, second]
+        window._refresh_layers()
+        self._select(window, [first, second])
+        window._merge_layers()
+        self.assertEqual(len(document.layers), 1)
+        merged = document.layers[0]
+        self.assertEqual(merged.kind, "vector")
+        self.assertEqual(merged.name, "a")
+        self.assertEqual([stroke.points[0].y for stroke in merged.strokes], [0.0, 10.0])
+        self.assertIs(document.layer(), merged)
+        self.assertEqual(self._selected_names(window), ["a"])
+
+    def test_merge_a_group_flattens_its_children(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        group = document.make_group(
+            "g",
+            [
+                Layer("a", [Stroke([Point(0, 0, 2), Point(10, 0, 2)])]),
+                Layer("b", [Stroke([Point(0, 10, 2), Point(10, 10, 2)])]),
+            ],
+        )
+        document.layers = [group]
+        window._refresh_layers()
+        self._select(window, [group])
+        window._merge_layers()
+        self.assertEqual(len(document.layers), 1)
+        merged = document.layers[0]
+        self.assertFalse(merged.is_group)
+        self.assertEqual(merged.kind, "vector")
+        self.assertEqual(len(merged.strokes), 2)
+
+    def test_merge_with_layer_opacity_rasterizes(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.width, document.height = 120, 80
+        first = Layer("a", [Stroke([Point(10, 10, 4), Point(50, 10, 4)])])
+        first.opacity = 0.5
+        second = Layer("b", [Stroke([Point(10, 40, 4), Point(50, 40, 4)])])
+        document.layers = [first, second]
+        window._refresh_layers()
+        self._select(window, [first, second])
+        window._merge_layers()
+        self.assertEqual(len(document.layers), 1)
+        merged = document.layers[0]
+        self.assertEqual(merged.kind, "raster")
+        self.assertIsNotNone(merged.image_base64)
+        image = layer_image(merged)
+        self.assertIsNotNone(image)
+        assert image is not None
+        self.assertEqual((image.width(), image.height()), (120, 80))
+
+    def test_drag_finish_rebuilds_the_tree_after_qt_removes_rows(self) -> None:
+        window = self._window()
+        document = window.canvas.doc
+        document.layers = [Layer("a"), Layer("b")]
+        window._refresh_layers()
+        tree = window._layer_list
+        self._select(window, [document.layers[1]])
+        tree.set_current_item(window._layer_items[id(document.layers[1])])
+        window._on_layer_drag_started()
+        self.assertTrue(window._drop_layers(document.layers, 0))
+        # InternalMove deletes the dragged rows from the view after the drop.
+        tree.clear()
+        window._on_layer_drag_finished()
+        self.assertEqual(tree.topLevelItemCount(), 2)
+        self.assertEqual(self._selected_names(window), ["b"])
+        self.assertIs(document.layer(), document.layers[0])
 
     def test_drop_target_mapping(self) -> None:
         window = self._window()

@@ -255,6 +255,19 @@ class Document:
             ordered.append(layer)
         return ordered
 
+    def selection_roots(self, layers: list[Layer]) -> list[Layer]:
+        """Selected nodes in draw order, without descendants of selected groups.
+
+        Selecting a group and one of its children acts on the group only: the
+        child is already part of it.
+        """
+        ordered = self.sort_layers(layers)
+        return [
+            layer
+            for layer in ordered
+            if not any(other is not layer and self.is_ancestor(other, layer) for other in ordered)
+        ]
+
     def group_owning(self, children: list[Layer]) -> Layer | None:
         """Group whose ``children`` list this is, or ``None`` for the top level."""
         for layer, _depth in self.walk():
@@ -387,6 +400,58 @@ class Document:
         siblings, index = located
         siblings[index : index + 1] = group.children
         return group.children[0] if group.children else None
+
+    def replace_layers(self, layers: list[Layer], replacement: Layer) -> int:
+        """Remove nodes and put ``replacement`` where the first one was."""
+        roots = self.selection_roots(layers)
+        if not roots:
+            return -1
+        located = self.locate(roots[0])
+        if located is None:
+            return -1
+        siblings, index = located
+        insert_at = sum(1 for item in siblings[:index] if not any(item is root for root in roots))
+        for layer in roots:
+            self.remove_layer(layer)
+        siblings.insert(insert_at, replacement)
+        return self.walk_index(replacement)
+
+    def _flatten_strokes(self, layer: Layer) -> list[Stroke] | None:
+        """Strokes in draw order if the node can be flattened without rasterising."""
+        if not layer.visible:
+            return []
+        if layer.opacity != 1.0 or layer.blend != "normal" or layer.clip != "off":
+            return None
+        if layer.is_group:
+            strokes: list[Stroke] = []
+            for child in layer.children:
+                part = self._flatten_strokes(child)
+                if part is None:
+                    return None
+                strokes.extend(part)
+            return strokes
+        if layer.kind != "vector":
+            return None
+        return list(layer.strokes)
+
+    def merge_layers(self, layers: list[Layer], name: str | None = None) -> Layer | None:
+        """Flatten selected nodes into one vector layer.
+
+        Returns ``None`` when opacity, blending, clipping or raster content means
+        the result has to be rendered to pixels instead.
+        """
+        roots = self.selection_roots(layers)
+        if not roots or (len(roots) == 1 and not roots[0].is_group):
+            return None
+        strokes: list[Stroke] = []
+        for layer in roots:
+            part = self._flatten_strokes(layer)
+            if part is None:
+                return None
+            strokes.extend(part)
+        merged = Layer(name=name or roots[0].name, strokes=strokes)
+        self.replace_layers(roots, merged)
+        return merged
 
     def layer_by_uid(self, uid: str) -> Layer | None:
         for layer, _depth in self.walk():

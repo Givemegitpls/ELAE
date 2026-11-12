@@ -37,6 +37,18 @@
   No polygon offsetting, so no self-intersection artifacts.
 - `sai/io.py` — JSON save/load, PNG export (transparent, scale), SVG export.
 - `sai/canvas.py` — input, tools, zoom/pan, undo snapshots (full `Document.copy()`).
+  `raster_view` (toolbar checkbox) bypasses vector repaints: `_raster_image()` renders the
+  **whole document at 1:1 PNG resolution** (`_raster_scale()`, clamped only above ~4000² by
+  `MAX_RASTER_PIXELS = 16M`, ARGB32) and `paintEvent` draws it into the page rect. This is
+  the point of the mode: it previews the actual exported PNG pixel grid. At zoom ≥ 100%
+  `SmoothPixmapTransform` is off, so the real pixels are shown — small features (a bolt's
+  2–3 px ring) can land unevenly on the pixel grid; that is the exported PNG, not a geometry
+  bug. Below 100% the downscale is smoothed. Cache is dropped by `invalidate_raster_view()`
+  — wired to `documentChanged` plus the interactive mutations that do not emit it (point
+  drags in `mouseMoveEvent`, `_apply_live_transform`) and UI-side mutations that skip
+  `Canvas` signals (layer visibility/opacity/blend/clip, canvas size, and
+  `MainWindow._refresh_layers`). Any new document mutation path must invalidate it or raster
+  view goes stale.
 - `sai/app.py` — toolbar, layers dock, menus. Layer list items are editable (`ItemIsEditable`);
   `_on_layer_item_changed` handles both the visibility checkbox and renames (compare `item.text()`
   with `layer.name`). Raster layers are marked with a generated icon instead of a `[image]` suffix,
@@ -90,6 +102,22 @@
   truth). Drop on a group item = append into it, `AboveItem`/`BelowItem` = insert at that
   sibling position, empty viewport = top level. Selection is preserved by layer identity
   across refreshes and is dropped after undo/redo (new document objects).
+- Qt's `InternalMove` removes the dragged **view rows** after a successful drop
+  (`QAbstractItemView::startDrag` → `clearOrRemove`), even though our `dropEvent` only edits
+  the document. That made dropped layers look like they vanished. `LayerTree.startDrag`
+  calls `on_drag_started`/`on_drag_finished`; the window defers the rebuild to the finish
+  callback (`_dragging_layers` flag) so the panel is re-synced **after** Qt's row removal.
+- `QTreeWidget.setCurrentItem()` clears the rest of an extended selection. Use
+  `LayerTree.set_current_item()`, which goes through `QItemSelectionModel.NoUpdate`, when
+  keeping multi-selection matters (refresh, right-click context menu).
+- Right-click is handled in `LayerTree.mousePressEvent`: clicking an already selected item
+  keeps the whole selection and only moves the current item, so the context menu's
+  group/merge/delete act on the full set.
+- `Document.selection_roots()` drops descendants of selected groups (group + child = group
+  only); used by group, merge and drag&drop. `Document.merge_layers()` flattens vector-only
+  selections (including groups with default composition) into one vector `Layer`; when any
+  node is raster or has opacity/blend/clip, `_merge_layers()` in `app.py` falls back to
+  `render.layers_image()` + `io.encode_image()` and inserts one raster layer.
 - Actions that may be no-ops (`_move_layer`, `_drop_layers`) take a `Document.copy()`
   snapshot first and call `Canvas.push_undo_snapshot()` only when something changed.
 - Rendering is recursive (`render._draw_stack`): a group draws its children into the current
@@ -115,6 +143,15 @@
   clipped siblings go through `_render_masked()`; the mask is composed in device pixels
   (`resetTransform`), and `inside` needs a buffer-sized mask copy so pixels outside the mask
   rect are cleared too.
+- **Subpixel alignment of clipped layers**: `_render_masked()` now receives the main painter
+  transform. For an axis-aligned view it renders the buffer at the device scale, snaps its
+  origin to whole device pixels, and derives the scene rect by inverse-mapping that device
+  rect; `_draw_buffer(device_rect=True)` then blits it 1:1 with no rounding at draw time.
+  Before this, `round(transform.mapRect(rect))` shifted clipped content by up to half a pixel:
+  at 1x a 2.5 px black ring around a clipped gray bolt became visibly thicker on one side
+  (user bug 2026-11-12, Group 3 / clip-to-below). Regression:
+  `RenderTests.test_clipped_layer_keeps_its_pixel_position` (empty base must leave a clipped
+  dot pixel-identical to clip off). Rotated views still use the smooth scene-rect fallback.
 - `visible=False` skips painting a node but **keeps it in the clip logic**: a hidden base is
   still rendered to its stencil buffer and masks its clipped siblings, and a hidden group
   base still clips. That is how a mask layer is hidden while staying a mask; only the

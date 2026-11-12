@@ -4,7 +4,7 @@ import itertools
 import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QMenu, QWidget
 
 from . import fill
@@ -15,6 +15,8 @@ from .transform import apply_transform, content_bounds, map_point
 
 # Fill tool preview: the figure under the cursor is tinted with the brush colour.
 FILL_PREVIEW_ALPHA = 70
+# 1:1 PNG preview cache: ~64 MB ARGB32. Only pages above ~4000² are downscaled.
+MAX_RASTER_PIXELS = 16_000_000
 
 
 def _merged_point(points: list[Point]) -> Point:
@@ -78,6 +80,9 @@ class Canvas(QWidget):
         self._hover: tuple[Stroke, int] | None = None
         self._hovered_stroke: Stroke | None = None
         self._recolor_dirty = False
+        # Raster view: one cached 1:1 document image instead of vector repaints.
+        self.raster_view = False
+        self._raster_cache: QImage | None = None
 
         self.transform_mode = False
         self._tr_layer: Layer | None = None
@@ -98,6 +103,7 @@ class Canvas(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.documentChanged.connect(self.clear_fill_preview)
+        self.documentChanged.connect(self.invalidate_raster_view)
 
     # --- document state -------------------------------------------------
     def set_document(self, document: Document) -> None:
@@ -200,6 +206,35 @@ class Canvas(QWidget):
         delta_y = (pos.y() - self.pan.y()) / self.zoom
         return QPointF(delta_x * cosine + delta_y * sine, -delta_x * sine + delta_y * cosine)
 
+    def _raster_scale(self) -> float:
+        """1:1 PNG preview scale; only oversized pages are capped for memory."""
+        pixels = max(1, self.doc.width * self.doc.height)
+        return min(1.0, math.sqrt(MAX_RASTER_PIXELS / pixels))
+
+    def _raster_image(self) -> QImage:
+        """Cached 1:1 render of the document — exactly the PNG pixel grid."""
+        cached = self._raster_cache
+        if cached is not None:
+            return cached
+        scale = self._raster_scale()
+        width = max(1, round(self.doc.width * scale))
+        height = max(1, round(self.doc.height * scale))
+        image = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.scale(scale, scale)
+        draw_document(
+            painter,
+            self.doc,
+            background=None,
+            skip_stroke=self._active_stroke,
+            scale=scale,
+        )
+        painter.end()
+        self._raster_cache = image
+        return image
+
     def set_rotation(self, degrees: float) -> None:
         """Rotate the view around the widget centre, keeping it on screen."""
         center = QPointF(self.width() / 2.0, self.height() / 2.0)
@@ -244,6 +279,20 @@ class Canvas(QWidget):
         self.clear_hover()
         self.clear_fill_preview()
         self.statusMessage.emit(f"scope: {'active layer' if self.scope == 'layer' else 'image'}")
+
+    def set_raster_view(self, enabled: bool) -> None:
+        """Show a cached 1:1 PNG render instead of repainting vectors."""
+        self.raster_view = bool(enabled)
+        self.invalidate_raster_view()
+        if self.raster_view:
+            self.statusMessage.emit("view: raster preview (1:1 PNG pixels)")
+        else:
+            self.statusMessage.emit("view: vectors")
+        self.update()
+
+    def invalidate_raster_view(self) -> None:
+        """Drop the cached raster preview; the next paint rebuilds it."""
+        self._raster_cache = None
 
     def clear_hover(self) -> None:
         self._hover = None
@@ -327,15 +376,22 @@ class Canvas(QWidget):
 
         page = QRectF(0, 0, self.doc.width, self.doc.height)
         painter.fillRect(page, QColor(255, 255, 255))
-        preview = self._preview_stroke()
-        draw_document(
-            painter,
-            self.doc,
-            background=None,
-            skip_stroke=self._active_stroke if preview is not None else None,
-            scale=self.zoom * self.devicePixelRatioF(),
-            view=self._visible_scene_rect(),
-        )
+        if self.raster_view:
+            # The cache is 1:1 with the exported PNG. Zooming in shows the actual
+            # pixel grid (nearest); zooming out downsamples smoothly.
+            device_scale = self.zoom * self.devicePixelRatioF()
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, device_scale < 1.0)
+            painter.drawImage(page, self._raster_image())
+        else:
+            preview = self._preview_stroke()
+            draw_document(
+                painter,
+                self.doc,
+                background=None,
+                skip_stroke=self._active_stroke if preview is not None else None,
+                scale=self.zoom * self.devicePixelRatioF(),
+                view=self._visible_scene_rect(),
+            )
         self._draw_overlay(painter)
 
         painter.restore()
@@ -577,6 +633,7 @@ class Canvas(QWidget):
             self.doc.width,
             self.doc.height,
         )
+        self.invalidate_raster_view()
         self.update()
 
     def _transform_hit(self, scene: QPointF) -> str:
@@ -990,6 +1047,7 @@ class Canvas(QWidget):
             for point, start_x, start_y in self._drag_starts:
                 point.x = start_x + delta.x()
                 point.y = start_y + delta.y()
+            self.invalidate_raster_view()
             self.statusMessage.emit(f"moved {len(self._drag_starts)} point(s)")
             self.update()
             return
@@ -997,6 +1055,7 @@ class Canvas(QWidget):
         if self._drag_point is not None:
             self._drag_point.x = scene.x()
             self._drag_point.y = scene.y()
+            self.invalidate_raster_view()
             self.statusMessage.emit(f"point {scene.x():.0f}, {scene.y():.0f}")
             self.update()
             return

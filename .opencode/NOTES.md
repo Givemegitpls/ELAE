@@ -99,7 +99,17 @@
   cropped mask (bbox from `silhouette.node_bounds`, +1 px AA), at
   `_mask_scale()` = `max(1, target)` capped by `MAX_MASK_PIXELS = 8M`; `draw_document(scale=)`
   is fed `zoom × devicePixelRatio` from `Canvas.paintEvent` and `scale` from `export_png`, so
-  clipped layers are not upscaled from document resolution. Masks are cached in
+  clipped layers are not upscaled from document resolution.
+- `draw_document(view=)` crops masks and their buffers to the visible scene rect
+  (`Canvas._visible_scene_rect()`, bbox of the widget corners through `to_scene`). Without it a
+  deep zoom hits `MAX_MASK_PIXELS` and the mask is upscaled (>8× on a 2000² page), which shows
+  as blurry/jagged clip edges. `view` must be threaded through `_draw_node()` as well —
+  dropping it there silently disables the cropping for groups.
+- Clip buffers go to the screen through `_draw_buffer()`: for an axis-aligned view it resets
+  the transform and draws the buffer into the **device rect** (1:1 pixels, no resampling); a
+  rotated view falls back to `drawImage(rect, buffer)` with `SmoothPixmapTransform`. Drawing
+  the buffer at natural size is wrong when the mask scale differs from the zoom: the content
+  lands shifted by the mask offset (bug seen as the spline drawn outside the screw). Masks are cached in
   `_MASK_CACHE` keyed by `(id(document), uid, _node_signature, scale, bounds, document size)`;
   `skip_stroke` (live preview) bypasses the cache. The base itself is drawn directly, only
   clipped siblings go through `_render_masked()`; the mask is composed in device pixels
@@ -121,7 +131,13 @@
   (`silhouette.outline_path`, `outside` = page path `.subtracted(path.simplified())`) when the
   base is opaque, otherwise `<mask>` with `mask-type="alpha"` (`"luminance"` + white rect +
   black mono content for `outside`). A hidden base is emitted inside the definitions only.
-  Raster layers export as `<image>` with a PNG data URI.
+  Raster layers export as `<image>` with a PNG data URI and the **image's own** size (not
+  the document size — that stretched them).
+- Verifying SVG fidelity: `io.export_png(...)` + `io.export_svg(...)`, render the SVG with
+  `rsvg-convert -w W -h H -b white in.svg -o out.png`, diff the buffers. Cassette artwork:
+  99.87% of pixels within 20, only ~35 px differ strongly — all on `clipPath` edges, because
+  the silhouette is polygonised (`_path_data`). Use `<mask>` instead of `clipPath` if exact
+  AA at the clip edge is required.
 
 ## Vector fills and scope switch
 - `Stroke.uid` / `Layer.uid` (uuid hex) are stable references; they survive copy and are

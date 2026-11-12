@@ -179,6 +179,21 @@ class Canvas(QWidget):
             self.pan.y() + (scene.x() * sine + scene.y() * cosine) * self.zoom,
         )
 
+    def _visible_scene_rect(self) -> QRectF:
+        """Bounding box of the widget in scene coordinates, for mask cropping."""
+        corners = [
+            QPointF(0.0, 0.0),
+            QPointF(self.width(), 0.0),
+            QPointF(0.0, self.height()),
+            QPointF(self.width(), self.height()),
+        ]
+        points = [self.to_scene(corner) for corner in corners]
+        xs = [point.x() for point in points]
+        ys = [point.y() for point in points]
+        return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)).adjusted(
+            -2.0, -2.0, 2.0, 2.0
+        )
+
     def to_scene(self, pos: QPointF) -> QPointF:
         cosine, sine = self._view_rotation()
         delta_x = (pos.x() - self.pan.x()) / self.zoom
@@ -319,6 +334,7 @@ class Canvas(QWidget):
             background=None,
             skip_stroke=self._active_stroke if preview is not None else None,
             scale=self.zoom * self.devicePixelRatioF(),
+            view=self._visible_scene_rect(),
         )
         self._draw_overlay(painter)
 

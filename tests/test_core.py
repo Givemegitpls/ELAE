@@ -344,6 +344,20 @@ class DocumentTests(unittest.TestCase):
         self.assertIn('clip-path="url(#clip0)"', text)
         self.assertNotIn('<g id="base">', text)
 
+    def test_svg_raster_keeps_its_own_size(self) -> None:
+        document = Document(60, 40)
+        image = QImage(30, 20, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QColor("red"))
+        document.layers = [
+            Layer("raster", kind="raster", image_base64=io.encode_image(image)),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "raster.svg"
+            io.export_svg(document, path)
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("<image", text)
+        self.assertIn('width="30" height="20"', text)
+
     def test_svg_export_nests_groups(self) -> None:
         document = Document(40, 40)
         inner = Layer("inner", [Stroke([Point(10, 10, 3), Point(30, 30, 3)])])
@@ -706,6 +720,42 @@ class RenderTests(unittest.TestCase):
         assert low is not None and high is not None
         self.assertGreater(high[2], low[2])
         self.assertGreater(high[0].width(), low[0].width())
+
+    def test_clip_mask_crops_to_the_view(self) -> None:
+        render_module._MASK_CACHE.clear()
+        document = Document(400, 400)
+        base = Layer("base", [Stroke([Point(200, 200, 40)])])
+        band = Layer(
+            "band",
+            [Stroke([Point(20, 200, 10), Point(380, 200, 10)], (255, 0, 0))],
+            clip="inside",
+        )
+        document.layers = [base, band]
+        view = QRectF(190, 190, 20, 20)
+        mask = render_module._clip_mask(document, base, None, 16.0, view)
+        assert mask is not None
+        bounds = mask[1]
+        self.assertTrue(view.contains(bounds))
+        self.assertEqual(mask[2], 16.0)
+        self.assertLessEqual(mask[0].width(), 22 * 16)
+
+    def test_clip_buffer_is_painted_where_it_belongs(self) -> None:
+        document = Document(60, 60)
+        base = Layer("base", [Stroke([Point(30, 30, 30)], (0, 0, 0))])
+        band = Layer(
+            "band", [Stroke([Point(10, 30, 10), Point(50, 30, 10)], (255, 0, 0))], clip="inside"
+        )
+        document.layers = [base, band]
+        image = QImage(140, 140, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        painter.translate(10, 10)
+        painter.scale(2.0, 2.0)
+        draw_document(painter, document, scale=2.0)
+        painter.end()
+        inside = image.pixelColor(10 + 2 * 30, 10 + 2 * 30)
+        self.assertEqual((inside.red(), inside.green(), inside.blue()), (255, 0, 0))
+        self.assertEqual(image.pixelColor(10 + 2 * 8, 10 + 2 * 30).alpha(), 0)
 
     def test_clip_mask_is_cached_between_frames(self) -> None:
         render_module._MASK_CACHE.clear()

@@ -12,7 +12,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath
 from . import silhouette
 from .geometry import sample_stroke
 from .model import Document, Layer
-from .render import draw_document
+from .render import draw_document, layer_image
 
 FORMAT = "sai-lineart"
 # Version 2 introduced shared masks (removed again), 3 adds layer groups.
@@ -86,10 +86,13 @@ def export_svg(document: Document, path: str | Path) -> None:
         indent = "  " * depth
         lines: list[str] = []
         if layer.kind == "raster" and layer.image_base64:
-            lines.append(
-                f'{indent}<image x="0" y="0" width="{width}" height="{height}" '
-                f'href="data:image/png;base64,{layer.image_base64}"/>'
-            )
+            raster = layer_image(layer)
+            if raster is not None:
+                lines.append(
+                    f'{indent}<image x="0" y="0" width="{raster.width()}" '
+                    f'height="{raster.height()}" '
+                    f'href="data:image/png;base64,{layer.image_base64}"/>'
+                )
         for stroke in layer.strokes:
             color = mono or "#{:02x}{:02x}{:02x}".format(*stroke.color)
             alpha = 1.0 if mono is not None else stroke.alpha / 255

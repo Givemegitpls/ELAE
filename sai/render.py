@@ -124,13 +124,14 @@ def _draw_node(
     skip_stroke: Stroke | None,
     composed: bool,
     scale: float,
+    view: QRectF | None = None,
 ) -> None:
     """Draw one layer or group; ``composed`` applies its own opacity/blend."""
     if composed:
         painter.save()
         _apply_composition(painter, layer, background)
     if layer.is_group:
-        _draw_stack(painter, layer.children, document, background, skip_stroke, scale)
+        _draw_stack(painter, layer.children, document, background, skip_stroke, scale, view)
     else:
         _draw_layer_content(painter, layer, skip_stroke)
     if composed:
@@ -177,6 +178,7 @@ def _clip_mask(
     layer: Layer,
     skip_stroke: Stroke | None,
     target_scale: float,
+    view: QRectF | None = None,
 ) -> tuple[QImage, QRectF, float] | None:
     """Cropped alpha mask of a clip base, cached by geometry and resolution."""
     bounds = node_bounds(layer)
@@ -184,6 +186,8 @@ def _clip_mask(
         bounds = QRectF(0, 0, document.width, document.height)
     page = QRectF(0, 0, document.width, document.height)
     bounds = bounds.adjusted(-1.0, -1.0, 1.0, 1.0).intersected(page)
+    if view is not None:
+        bounds = bounds.intersected(view)
     if bounds.width() < 0.5 or bounds.height() < 0.5:
         return None
     scale = _mask_scale(bounds, target_scale)
@@ -229,6 +233,7 @@ def _render_masked(
     skip_stroke: Stroke | None,
     mask: tuple[QImage, QRectF, float],
     clip: str,
+    view: QRectF | None = None,
 ) -> tuple[QImage, QRectF] | None:
     """Render a clipped layer into a cropped buffer and apply the base mask."""
     mask_image, mask_bounds, scale = mask
@@ -239,6 +244,8 @@ def _render_masked(
     else:
         bounds = bounds.adjusted(-1.0, -1.0, 1.0, 1.0)
     rect = mask_bounds.united(bounds).intersected(page)
+    if view is not None:
+        rect = rect.intersected(view)
     if rect.width() < 0.5 or rect.height() < 0.5:
         return None
     width = max(1, round(rect.width() * scale))
@@ -283,6 +290,28 @@ def _draw_image(
     painter.restore()
 
 
+def _draw_buffer(painter: QPainter, rect: QRectF, buffer: QImage) -> None:
+    """Draw a clip buffer 1:1 in device pixels, so its AA edge is not resampled."""
+    transform = painter.transform()
+    axis_aligned = abs(transform.m12()) < 1e-6 and abs(transform.m21()) < 1e-6
+    if not axis_aligned:
+        # Rotated view: the buffer must follow the transform.
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawImage(rect, buffer)
+        painter.restore()
+        return
+    device = transform.mapRect(rect)
+    painter.save()
+    painter.resetTransform()
+    # Scale to the exact device rect: the buffer may be built at a lower mask scale.
+    painter.drawImage(
+        QRectF(round(device.x()), round(device.y()), round(device.width()), round(device.height())),
+        buffer,
+    )
+    painter.restore()
+
+
 def _draw_stack(
     painter: QPainter,
     layers: list[Layer],
@@ -290,6 +319,7 @@ def _draw_stack(
     background: QColor | None,
     skip_stroke: Stroke | None,
     scale: float,
+    view: QRectF | None,
 ) -> None:
     """Draw siblings in order; ``clip`` refers to the previous sibling.
 
@@ -310,30 +340,44 @@ def _draw_stack(
         if not clipped:
             if layer.visible:
                 _draw_node(
-                    painter, layer, document, background, skip_stroke, composed=True, scale=scale
+                    painter,
+                    layer,
+                    document,
+                    background,
+                    skip_stroke,
+                    composed=True,
+                    scale=scale,
+                    view=view,
                 )
             index = cursor
             continue
 
         if layer.visible:
             _draw_node(
-                painter, layer, document, background, skip_stroke, composed=True, scale=scale
+                painter,
+                layer,
+                document,
+                background,
+                skip_stroke,
+                composed=True,
+                scale=scale,
+                view=view,
             )
 
-        mask = _clip_mask(document, layer, skip_stroke, scale)
+        mask = _clip_mask(document, layer, skip_stroke, scale, view)
         if mask is not None:
             for clipped_layer in clipped:
                 if not clipped_layer.visible:
                     continue
                 masked = _render_masked(
-                    document, clipped_layer, skip_stroke, mask, clipped_layer.clip
+                    document, clipped_layer, skip_stroke, mask, clipped_layer.clip, view
                 )
                 if masked is None:
                     continue
                 buffer, rect = masked
                 painter.save()
                 _apply_composition(painter, clipped_layer, background)
-                painter.drawImage(rect, buffer)
+                _draw_buffer(painter, rect, buffer)
                 painter.restore()
 
         index = cursor
@@ -345,8 +389,13 @@ def draw_document(
     background: QColor | None = None,
     skip_stroke: Stroke | None = None,
     scale: float = 1.0,
+    view: QRectF | None = None,
 ) -> None:
-    """Render the document; ``scale`` is the device scale (zoom or export scale)."""
+    """Render the document; ``scale`` is the device scale, ``view`` the visible area.
+
+    ``view`` (scene coordinates) crops clip masks and their buffers, so a deep zoom
+    keeps the mask at screen resolution instead of hitting the memory budget.
+    """
     if background is not None:
         painter.fillRect(QRectF(0, 0, document.width, document.height), background)
-    _draw_stack(painter, document.layers, document, background, skip_stroke, scale)
+    _draw_stack(painter, document.layers, document, background, skip_stroke, scale, view)

@@ -95,6 +95,11 @@
 - Rendering is recursive (`render._draw_stack`): a group draws its children into the current
   painter, and `_apply_composition()` **multiplies** `painter.opacity()` by the node's
   opacity — otherwise a group opacity would be overwritten by its children's 1.0.
+- `visible=False` skips painting a node but **keeps it in the clip logic**: a hidden base is
+  still rendered to its stencil buffer and masks its clipped siblings, and a hidden group
+  base still clips. That is how a mask layer is hidden while staying a mask; only the
+  painted output disappears. Tests: `test_hidden_base_still_clips_inside/outside`,
+  `test_hidden_group_base_still_clips`.
 - `clip` refers to the **previous sibling in the same list**, not the global layer below:
   `inside` = `DestinationIn` with the base render, `outside` = `DestinationOut`. A group can
   be the base for a clipped layer and can itself be clipped.

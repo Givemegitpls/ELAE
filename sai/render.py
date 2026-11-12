@@ -168,13 +168,15 @@ def _draw_stack(
     background: QColor | None,
     skip_stroke: Stroke | None,
 ) -> None:
-    """Draw siblings in order; ``clip`` refers to the previous sibling."""
+    """Draw siblings in order; ``clip`` refers to the previous sibling.
+
+    A hidden node is not painted, but it still acts as the clip base for its
+    clipped siblings (and its own hidden children feed the stencil). That is how
+    one hides a mask layer without losing the masking.
+    """
     index = 0
     while index < len(layers):
         layer = layers[index]
-        if not layer.visible:
-            index += 1
-            continue
 
         clipped: list[Layer] = []
         cursor = index + 1
@@ -183,12 +185,14 @@ def _draw_stack(
             cursor += 1
 
         if not clipped:
-            _draw_node(painter, layer, document, background, skip_stroke, composed=True)
+            if layer.visible:
+                _draw_node(painter, layer, document, background, skip_stroke, composed=True)
             index = cursor
             continue
 
         base = _render_node(document, layer, skip_stroke)
-        _draw_image(painter, base, layer, background)
+        if layer.visible:
+            _draw_image(painter, base, layer, background)
 
         for clipped_layer in clipped:
             if not clipped_layer.visible:

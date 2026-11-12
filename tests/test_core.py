@@ -457,6 +457,51 @@ class RenderTests(unittest.TestCase):
         self.assertEqual((outside.red(), outside.green(), outside.blue()), (0, 0, 0))
         self.assertEqual(image.pixelColor(50, 30).alpha(), 0)
 
+    def test_hidden_base_still_clips_inside(self) -> None:
+        document = Document(60, 60)
+        base = Layer("base", [Stroke([Point(30, 30, 30)], (0, 0, 0))], visible=False)
+        band = Layer(
+            "band",
+            [Stroke([Point(10, 30, 10), Point(50, 30, 10)], (255, 0, 0))],
+            clip="inside",
+        )
+        document.layers = [base, band]
+        image = self._render(document)
+        inside = image.pixelColor(30, 30)
+        self.assertEqual((inside.red(), inside.green(), inside.blue()), (255, 0, 0))
+        self.assertEqual(image.pixelColor(10, 30).alpha(), 0)
+
+    def test_hidden_base_clips_outside(self) -> None:
+        document = Document(60, 60)
+        base = Layer("base", [Stroke([Point(30, 30, 30)], (0, 0, 0))], visible=False)
+        band = Layer(
+            "band",
+            [Stroke([Point(10, 30, 10), Point(50, 30, 10)], (255, 0, 0))],
+            clip="outside",
+        )
+        document.layers = [base, band]
+        image = self._render(document)
+        self.assertEqual(image.pixelColor(30, 30).alpha(), 0)
+        outside = image.pixelColor(10, 30)
+        self.assertEqual((outside.red(), outside.green(), outside.blue()), (255, 0, 0))
+
+    def test_hidden_group_base_still_clips(self) -> None:
+        document = Document(60, 60)
+        group = document.make_group(
+            "group", [Layer("dot", [Stroke([Point(30, 30, 30)], (0, 0, 0))])]
+        )
+        group.visible = False
+        band = Layer(
+            "band",
+            [Stroke([Point(10, 30, 10), Point(50, 30, 10)], (255, 0, 0))],
+            clip="inside",
+        )
+        document.layers = [group, band]
+        image = self._render(document)
+        inside = image.pixelColor(30, 30)
+        self.assertEqual((inside.red(), inside.green(), inside.blue()), (255, 0, 0))
+        self.assertEqual(image.pixelColor(10, 30).alpha(), 0)
+
     def test_group_can_be_the_clip_base(self) -> None:
         document = Document(60, 60)
         group = document.make_group(
